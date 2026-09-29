@@ -1,6 +1,6 @@
 # Learned hashing pilot
 
-Test whether an autoencoder's binary latent codes preserve Fashion-MNIST clothing categories better than simple projection baselines at the same bit budget. This is a similarity-search experiment, not an exact-key hash-table benchmark.
+Test whether an autoencoder's binary latent codes preserve category similarity better than projection baselines at the same bit budget. Fashion-MNIST is the development dataset; KMNIST tests the frozen configuration on a new benchmark. This is similarity search, not an exact-key hash-table benchmark.
 
 ## Run (PowerShell)
 
@@ -182,6 +182,32 @@ The 16-bit weight and scores are unchanged. At 32 and 64 bits, smaller weights i
 
 Reports and all 15 selected model artifacts are in `results/qat-median/`; every artifact passed reload checks on all 10,000 validation encodings and codes. Both saved `binary_thresholds` and `median_thresholds` are the training medians. The first two comparison columns reuse `results/quantization-v2/`, and the previous quantization column uses `results/qat/`. Models were retrained for the new sweep, including the unchanged 16-bit reference.
 
+## Frozen-configuration KMNIST benchmark
+
+```powershell
+# Smoke uses only KMNIST validation queries, never official test queries.
+.venv/Scripts/python benchmark_transfer.py --smoke --output-dir results/kmnist-smoke-next
+.venv/Scripts/python benchmark_transfer.py --output-dir results/kmnist-frozen-next
+```
+
+`benchmark_transfer.py` reads `results/qat-median/tuning.json` by default (`--source` selects another compatible report). It writes `protocol.json` with the source SHA-256, fixed weights, training settings, and library versions before loading the benchmark. It requires a fresh output directory and the same library versions as the source. There is no weight-search option.
+
+KMNIST contains 28x28 grayscale Japanese characters in ten classes. Models are trained from scratch on KMNIST; this transfers hyperparameters, not learned weights or zero-shot predictions. The architecture, preprocessing, 20 epochs, batch size 256, training-median thresholds, and weights 0.001/0.0003/0.0003 for 16/32/64 bits remain fixed from Fashion-MNIST. Each of the same five seeds uses 50,000 official training images as both fit set and retrieval database, 10,000 remaining training images for validation-MSE checkpoint selection, and the official 10,000 test images as queries. No test labels select models or settings. PCA and the plain AE use the same splits and bit budgets.
+
+The initial smoke run stopped before training because Python's downloader could not validate the official server's TLS certificate. Archives were then downloaded from `https://codh.rois.ac.jp/kmnist/dataset/kmnist/` through Windows certificate-checked HTTPS and matched against all four torchvision-supplied MD5 digests. No TLS checks were disabled. The retry used the local cache and completed validation-only evaluation; the frozen settings were not changed after the smoke results.
+
+The full run took 12 minutes 53 seconds. **KMNIST test precision@10 (%)**, mean +/- sample standard deviation across five seeds:
+
+| Bits | PCA median | Plain AE median | Frozen quantization AE median | Gain over PCA (points) |
+|---|---:|---:|---:|---:|
+| 16 | 53.74 +/- 0.13 | 53.94 +/- 0.89 | 57.06 +/- 0.28 | +3.32 |
+| 32 | 65.41 +/- 0.12 | 63.11 +/- 0.69 | 65.13 +/- 0.19 | -0.28 |
+| 64 | 71.81 +/- 0.09 | 72.24 +/- 0.33 | 73.44 +/- 0.34 | +1.63 |
+
+The quantization AE beat the plain AE in all five seeds at every bit length, with mean gains of 3.13, 2.02, and 1.19 points. Against PCA it won 5/5 seeds at 16 bits, 2/5 at 32 bits, and 5/5 at 64 bits. This supports transfer of the quantization benefit over the plain AE, but not uniform superiority to PCA or a state-of-the-art claim. Seed variation reuses the same test images and is not a confidence interval over independent datasets. The retrieval database still contains training items; unseen-database generalization and broader baseline tuning remain unchecked.
+
+Reports, the pre-run protocol, and all 45 fitted model/transform artifacts are in `results/kmnist-frozen/`. Every artifact passed query-encoding and binary-code reload checks on all 10,000 test queries. `results/kmnist-smoke/` retains the failed download's protocol only; `results/kmnist-smoke-v2/` contains the successful smoke results. Do not merge these KMNIST test scores with the preceding Fashion-MNIST validation tables.
+
 ## Next decision
 
-Freeze the median-threshold quantization configuration as a candidate rather than continuing to optimize the same validation results. Compare against PCA on a new benchmark or genuinely untouched evaluation split before claiming an advantage. An unseen retrieval database and comparable baseline tuning remain necessary for stronger evidence; Fashion-MNIST alone does not support a state-of-the-art claim.
+Keep the recipe frozen. Next, evaluate an unseen retrieval database to separate generalization from fitting the database items. Use a predeclared protocol or fresh data rather than tuning against the now-inspected KMNIST test results. Compare with stronger established hashing baselines before making broader performance claims.

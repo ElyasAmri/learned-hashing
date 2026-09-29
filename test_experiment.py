@@ -2,12 +2,13 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import numpy as np
 import torch
 from sklearn.decomposition import PCA
 
+from benchmark_transfer import frozen_settings, run_pca
 from diagnose_quantization import continuous_neighbors, fit_itq, load_artifact, save_artifact
 from experiment import (Autoencoder, code_statistics, encode, evaluate, load_data,
                         hamming_neighbors, pair_distances, quantize, quantization_penalty, separation_penalty,
@@ -255,6 +256,79 @@ class QuantizationTests(unittest.TestCase):
                                               (original - mean) @ rotation > 0)
                 with self.assertRaises(FileExistsError):
                     save_artifact(path, method, model, mean, thresholds, rotation)
+
+
+class TransferTests(unittest.TestCase):
+    def setUp(self):
+        self.source = {
+            "config": {"penalties": ["quantization"], "quantization_threshold": "median",
+                       "query_split": "validation", "epochs": 20, "batch_size": 256,
+                       "train_size": 50000, "validation_size": 10000, "query_size": 10000,
+                       "bits": [16, 32, 64], "seeds": [42, 7, 21, 84, 123],
+                       "checkpoint_selection": "minimum_validation_reconstruction_mse"},
+            "selected_weights": {"16": {"quantization": 0.001}, "32": {"quantization": 0.0003},
+                                 "64": {"quantization": 0.0003}},
+        }
+
+    def test_frozen_settings_preserve_training_and_weights(self):
+        config, weights = frozen_settings(self.source)
+        self.assertEqual(config["dataset"], "kmnist")
+        self.assertEqual(config["query_split"], "test")
+        for key in ["epochs", "batch_size", "train_size", "validation_size", "query_size", "bits", "seeds"]:
+            self.assertEqual(config[key], self.source["config"][key])
+        self.assertEqual(weights, {"16": 0.001, "32": 0.0003, "64": 0.0003})
+        self.assertEqual(self.source["config"]["query_split"], "validation")
+
+    def test_smoke_settings_never_use_test_queries(self):
+        config, weights = frozen_settings(self.source, smoke=True)
+        self.assertEqual(config["query_split"], "validation")
+        self.assertEqual(config["epochs"], 1)
+        self.assertEqual(config["bits"], [16])
+        self.assertEqual(weights, {"16": 0.001})
+        self.assertEqual(self.source["config"]["epochs"], 20)
+
+    def test_reject_nonmedian_source(self):
+        self.source["config"]["quantization_threshold"] = "zero"
+        with self.assertRaisesRegex(ValueError, "median-threshold"):
+            frozen_settings(self.source)
+
+    def test_kmnist_loading_uses_separate_official_splits(self):
+        class FakeDataset:
+            def __init__(self, size, offset):
+                self.targets = torch.arange(size) + offset
+                self.data = self.targets.reshape(-1, 1).expand(-1, 784)
+
+            def __len__(self):
+                return len(self.targets)
+
+        def factory(root, train, download):
+            return FakeDataset(60000, 0) if train else FakeDataset(10000, 60000)
+
+        with patch("experiment.FashionMNIST") as fashion, patch("experiment.KMNIST", side_effect=factory) as kmnist:
+            train, validation, queries, labels, query_labels = load_data("unused", 42, 5, 3, 2, dataset="kmnist")
+            self.assertEqual(kmnist.call_args_list, [call("unused", train=True, download=True),
+                                                   call("unused", train=False, download=True)])
+            fashion.assert_not_called()
+        self.assertTrue((query_labels >= 60000).all())
+        self.assertTrue((labels < 60000).all())
+        self.assertEqual(queries.shape, (2, 784))
+        with patch("experiment.KMNIST", side_effect=factory) as kmnist:
+            data = load_data("unused", 42, 5, 3, 2, query_split="validation", dataset="kmnist")
+            kmnist.assert_called_once_with("unused", train=True, download=True)
+            np.testing.assert_array_equal(data[2], validation[:2])
+
+    def test_transfer_pca_saves_and_reloads_codes(self):
+        rng = np.random.default_rng(9)
+        train = rng.random((24, 784), dtype=np.float32)
+        queries = rng.random((8, 784), dtype=np.float32)
+        data = (train, queries, queries, np.arange(24) % 2, np.arange(8) % 2)
+        with tempfile.TemporaryDirectory() as root:
+            result = run_pca(data, 4, 42, "test", Path(root) / "pca")
+            self.assertEqual(result["artifact_roundtrip"], "passed")
+            self.assertIn("test_precision_at_10", result)
+            self.assertNotIn("validation_precision_at_10", result)
+            transform, saved = load_artifact(Path(root) / "pca")
+            np.testing.assert_array_equal(saved["binary_thresholds"], np.median(transform(train), axis=0))
 
 
 if __name__ == "__main__":

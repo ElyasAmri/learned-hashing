@@ -11,7 +11,7 @@ import torch
 from sklearn.decomposition import PCA
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
-from torchvision.datasets import FashionMNIST
+from torchvision.datasets import FashionMNIST, KMNIST
 
 
 POPCOUNT = np.array([i.bit_count() for i in range(256)], dtype=np.uint8)
@@ -162,8 +162,14 @@ def evaluate(database_codes, query_codes, database_labels, query_labels, k):
     }
 
 
-def load_data(root, seed, train_size, validation_size, query_size, query_split="test"):
-    official_train = FashionMNIST(root, train=True, download=True)
+def load_data(root, seed, train_size, validation_size, query_size, query_split="test", dataset="fashion_mnist"):
+    if dataset == "fashion_mnist":
+        dataset_class = FashionMNIST
+    elif dataset == "kmnist":
+        dataset_class = KMNIST
+    else:
+        raise ValueError(f"Unknown dataset: {dataset}")
+    official_train = dataset_class(root, train=True, download=True)
     rng = np.random.default_rng(seed)
     order = rng.permutation(len(official_train))
     # Keep validation disjoint and fixed even when reducing the training size.
@@ -175,7 +181,7 @@ def load_data(root, seed, train_size, validation_size, query_size, query_split="
         query_dataset = official_train
         query_ids = validation_ids[:query_size]
     elif query_split == "test":
-        query_dataset = FashionMNIST(root, train=False, download=True)
+        query_dataset = dataset_class(root, train=False, download=True)
         query_ids = rng.permutation(len(query_dataset))[:query_size]
     else:
         raise ValueError(f"Unknown query split: {query_split}")
