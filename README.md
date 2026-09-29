@@ -53,7 +53,7 @@ Timing: fit including threshold calibration, database encoding, query encoding, 
 .venv/Scripts/python penalty_experiment.py --stage test
 ```
 
-The runner also supports `--stage all` (default). Use `--output-dir` for a fresh run; existing reports are never overwritten. Test-only runs load `tuning.json` from that directory and check training settings, penalty selection, and library versions. `--seeds` can select remaining evaluation seeds after an interrupted run. `--query-split validation` keeps final evaluation on validation data even when the stage is named `test`. `--penalties` selects which losses to run; defaults remain the two reciprocal-distance penalties.
+The runner also supports `--stage all` (default). Use `--output-dir` for a fresh run; existing reports are never overwritten. Test-only runs load `tuning.json` from that directory and check training settings, penalty and quantization-threshold choices, and library versions. `--seeds` can select remaining evaluation seeds after an interrupted run. `--query-split validation` keeps final evaluation on validation data even when the stage is named `test`. `--penalties` selects which losses to run; defaults remain the two reciprocal-distance penalties.
 
 Both variants minimize `reconstruction_MSE + weight * mean(1 / (0.001 + distance))`. Distances compare `softmax(z)` distributions (temperature 1), not raw latent-vector geometry:
 
@@ -148,7 +148,7 @@ The architecture and decoder inputs remain unchanged. Training adds `weight * me
 
 Weights are selected separately for each bit length using **zero-threshold** precision@10 on the first 2,000 validation images at seed 42. The grid is `0.001, 0.01, 0.1, 1.0`; ties favor smaller weights. Checkpoints still minimize validation reconstruction MSE. Selected weights are fixed for five seeds and all 10,000 validation queries. Median-threshold retrieval is a prespecified secondary diagnostic, not used to choose weights. No official test images are loaded. These are development results: the final validation queries overlap tuning and checkpoint selection, and the baselines did not receive a comparable loss-weight search.
 
-The run took 10 minutes 25 seconds: 12 tuning candidates and 15 selected-weight models, each trained for 20 epochs. The smallest weight, `0.001`, was selected at all three bit lengths, so smaller weights remain unexplored. Mean +/- sample standard deviation of validation precision@10 (%):
+The run took 10 minutes 25 seconds: 12 tuning candidates and 15 selected-weight models, each trained for 20 epochs. The smallest weight, `0.001`, was selected at all three bit lengths, motivating the smaller-weight sweep below. Mean +/- sample standard deviation of validation precision@10 (%):
 
 | Bits | PCA median | Plain AE median | AE + ITQ | Quantization AE zero (primary) | Quantization AE median (diagnostic) |
 |---|---:|---:|---:|---:|---:|
@@ -162,6 +162,26 @@ At weights 0.1 and 1.0, every database item received the same zero-threshold cod
 
 Reports are in `results/qat/`; selected models are in `results/qat/models/seed-{seed}/quantization-{bits}/`. Use `load_artifact` to obtain the encoder and arrays. Primary codes are `z > binary_thresholds` (saved zeros); diagnostic codes are `z > median_thresholds`. These artifacts contain an identity rotation only for format compatibility, not a fitted ITQ transform. All 15 artifacts passed reload checks on all 10,000 query encodings and both code types. Tuning candidates were not saved.
 
+## Smaller weights with fixed median thresholds
+
+```powershell
+.venv/Scripts/python penalty_experiment.py --penalties quantization --quantization-threshold median --query-split validation --save-models --weights 0.00001 0.00003 0.0001 0.0003 0.001 --output-dir results/qat-median-next
+```
+
+The threshold rule is fixed before both selection and evaluation; every threshold is a training-set median. `--quantization-threshold` defaults to `zero` for previous commands. A resumed evaluation rejects a different threshold rule from its tuning report. All other training, seed, checkpoint, and validation settings match the preceding experiment. Weights are selected on 2,000 validation queries at seed 42, then fixed for five-seed evaluation on all 10,000 validation queries. No official test images are loaded.
+
+The run took 7 minutes 31 seconds: 15 tuning candidates and 15 selected-weight models, each trained for 20 epochs. Mean +/- sample standard deviation of validation precision@10 (%):
+
+| Bits | PCA median | Plain AE median | Previous quantization AE median | Tuned quantization AE median | Selected weight |
+|---|---:|---:|---:|---:|---:|
+| 16 | 66.38 +/- 0.33 | 62.42 +/- 1.43 | 67.06 +/- 0.72 | 67.06 +/- 0.72 | 0.001 |
+| 32 | 73.54 +/- 0.26 | 70.87 +/- 0.73 | 73.18 +/- 0.62 | 73.63 +/- 0.31 | 0.0003 |
+| 64 | 77.49 +/- 0.47 | 75.90 +/- 0.23 | 77.27 +/- 0.60 | 77.73 +/- 0.41 | 0.0003 |
+
+The 16-bit weight and scores are unchanged. At 32 and 64 bits, smaller weights improved the mean over the preceding median diagnostic by 0.45 and 0.46 points. Paired mean gains over PCA were 0.68, 0.09, and 0.25 points, with wins in 4/5 seeds at each bit length. Gains over the plain AE were 4.64, 2.77, and 1.84 points, with wins in all five seeds. These small PCA margins are not significance claims: development queries have been reused, seed-42 tuning overlaps evaluation, and PCA did not receive comparable hyperparameter search.
+
+Reports and all 15 selected model artifacts are in `results/qat-median/`; every artifact passed reload checks on all 10,000 validation encodings and codes. Both saved `binary_thresholds` and `median_thresholds` are the training medians. The first two comparison columns reuse `results/quantization-v2/`, and the previous quantization column uses `results/qat/`. Models were retrained for the new sweep, including the unchanged 16-bit reference.
+
 ## Next decision
 
-Test smaller quantization weights with median thresholds fixed in advance, or a separate balance-loss ablation, using validation data. The weak quantization penalty plus median thresholds improved the AE; stronger penalties caused collapse, and zero thresholds lost quality at 32/64 bits. Do not change the architecture yet or tune against the already-inspected test results. Larger benchmarks and an unseen retrieval database remain necessary; Fashion-MNIST alone does not support a state-of-the-art claim.
+Freeze the median-threshold quantization configuration as a candidate rather than continuing to optimize the same validation results. Compare against PCA on a new benchmark or genuinely untouched evaluation split before claiming an advantage. An unseen retrieval database and comparable baseline tuning remain necessary for stronger evidence; Fashion-MNIST alone does not support a state-of-the-art claim.

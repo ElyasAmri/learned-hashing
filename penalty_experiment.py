@@ -35,7 +35,8 @@ def run_variant(data, bits, penalty, weight, args, seed, split, artifact_dir=Non
                                        args.device, seed, penalty, weight)
     latent = encode(model, train, args.device)
     median_thresholds = np.median(latent, axis=0)
-    thresholds = np.zeros(bits, dtype=np.float32) if penalty == "quantization" else median_thresholds
+    threshold_rule = args.quantization_threshold if penalty == "quantization" else "median"
+    thresholds = np.zeros(bits, dtype=np.float32) if threshold_rule == "zero" else median_thresholds
     fit_seconds = time.perf_counter() - start
     database_codes = quantize(latent, thresholds)
     start = time.perf_counter()
@@ -46,10 +47,13 @@ def run_variant(data, bits, penalty, weight, args, seed, split, artifact_dir=Non
     metrics[f"{split}_precision_at_10"] = metrics.pop("same_class_precision_at_10")
     extra = {}
     if penalty == "quantization":
-        median_metrics = evaluate(quantize(latent, median_thresholds), quantize(query_latent, median_thresholds),
-                                  labels, query_labels, 10)
-        median_metrics[f"{split}_precision_at_10"] = median_metrics.pop("same_class_precision_at_10")
-        extra = {"threshold_rule": "zero", "median_binary": median_metrics,
+        if threshold_rule == "median":
+            median_metrics = metrics.copy()
+        else:
+            median_metrics = evaluate(quantize(latent, median_thresholds), quantize(query_latent, median_thresholds),
+                                      labels, query_labels, 10)
+            median_metrics[f"{split}_precision_at_10"] = median_metrics.pop("same_class_precision_at_10")
+        extra = {"threshold_rule": threshold_rule, "median_binary": median_metrics,
                  "training_quantization_mse": float(np.square(np.abs(latent) - 1).mean()),
                  "query_quantization_mse": float(np.square(np.abs(query_latent) - 1).mean())}
     if artifact_dir is not None:
@@ -88,6 +92,7 @@ def main():
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 7, 21, 84, 123])
     parser.add_argument("--weights", type=float, nargs="+", default=[1e-6, 1e-5, 1e-4, 1e-3])
     parser.add_argument("--penalties", nargs="+", choices=PENALTIES + ["quantization"], default=PENALTIES)
+    parser.add_argument("--quantization-threshold", choices=["zero", "median"], default="zero")
     parser.add_argument("--query-split", choices=["test", "validation"], default="test")
     parser.add_argument("--save-models", action="store_true")
     parser.add_argument("--epochs", type=int, default=20)
@@ -146,6 +151,9 @@ def main():
                 parser.error(f"Test configuration differs from tuning: {key}")
         if tuning["config"].get("penalties", PENALTIES) != args.penalties:
             parser.error("Penalty selection differs from tuning")
+        if ("quantization" in args.penalties
+                and tuning["config"].get("quantization_threshold", "zero") != args.quantization_threshold):
+            parser.error("Quantization threshold rule differs from tuning")
         if tuning["versions"] != versions:
             parser.error("Library versions differ from tuning")
     if args.stage != "tune":

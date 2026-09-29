@@ -161,7 +161,7 @@ class QuantizationTests(unittest.TestCase):
         train = rng.random((16, 784), dtype=np.float32)
         validation = rng.random((8, 784), dtype=np.float32)
         data = (train, validation, validation, np.arange(16) % 2, np.arange(8) % 2)
-        args = SimpleNamespace(epochs=1, batch_size=8, device="cpu")
+        args = SimpleNamespace(epochs=1, batch_size=8, device="cpu", quantization_threshold="zero")
         with tempfile.TemporaryDirectory() as root:
             result = run_variant(data, 4, "quantization", 0.01, args, 42, "validation", Path(root) / "model")
             self.assertEqual(result["artifact_roundtrip"], "passed")
@@ -171,6 +171,24 @@ class QuantizationTests(unittest.TestCase):
             self.assertIn("validation_precision_at_10", result["median_binary"])
             _, arrays = load_artifact(Path(root) / "model")
             np.testing.assert_array_equal(arrays["binary_thresholds"], np.zeros(4))
+
+    def test_quantization_median_rule_uses_training_thresholds(self):
+        rng = np.random.default_rng(9)
+        train = rng.random((16, 784), dtype=np.float32)
+        validation = rng.random((8, 784), dtype=np.float32)
+        data = (train, validation, validation, np.arange(16) % 2, np.arange(8) % 2)
+        args = SimpleNamespace(epochs=1, batch_size=8, device="cpu", quantization_threshold="median")
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "model"
+            with patch("penalty_experiment.evaluate", wraps=evaluate) as evaluator:
+                result = run_variant(data, 4, "quantization", 0.0001, args, 42, "validation", path)
+                self.assertEqual(evaluator.call_count, 1)
+            self.assertEqual(result["threshold_rule"], "median")
+            self.assertEqual(result["validation_precision_at_10"], result["median_binary"]["validation_precision_at_10"])
+            self.assertEqual(result["artifact_roundtrip"], "passed")
+            transform, saved = load_artifact(path)
+            np.testing.assert_array_equal(saved["binary_thresholds"], np.median(transform(train), axis=0))
+            np.testing.assert_array_equal(saved["binary_thresholds"], saved["median_thresholds"])
 
     def test_continuous_search_matches_direct_distances(self):
         rng = np.random.default_rng(12)
