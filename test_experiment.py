@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -9,9 +10,9 @@ from sklearn.decomposition import PCA
 
 from diagnose_quantization import continuous_neighbors, fit_itq, load_artifact, save_artifact
 from experiment import (Autoencoder, code_statistics, encode, evaluate, load_data,
-                        hamming_neighbors, pair_distances, quantize, separation_penalty,
+                        hamming_neighbors, pair_distances, quantize, quantization_penalty, separation_penalty,
                         train_autoencoder)
-from penalty_experiment import PENALTIES, select_weights
+from penalty_experiment import PENALTIES, run_variant, select_weights
 
 
 class HashingTests(unittest.TestCase):
@@ -132,13 +133,45 @@ class HashingTests(unittest.TestCase):
         self.assertEqual(history, zero_history)
         for name, value in baseline.state_dict().items():
             torch.testing.assert_close(value, zero.state_dict()[name], rtol=0, atol=0)
-        for penalty in PENALTIES:
+        for penalty in PENALTIES + ["quantization"]:
             model, history = train_autoencoder(train, validation, 4, 2, 8, "cpu", 42, penalty, 1e-4)
             self.assertTrue(np.isfinite(history).all())
             self.assertTrue(np.isfinite(encode(model, validation, "cpu")).all())
 
 
 class QuantizationTests(unittest.TestCase):
+    def test_quantization_penalty_targets_binary_values(self):
+        self.assertEqual(quantization_penalty(torch.tensor([[-1., 1.]])).item(), 0)
+        self.assertEqual(quantization_penalty(torch.zeros(2, 3)).item(), 1)
+        z = torch.tensor([[0.25, 2., -0.25, -2.]], requires_grad=True)
+        loss = quantization_penalty(z)
+        loss.backward()
+        np.testing.assert_array_equal(torch.sign(z.grad).numpy(), [[-1, 1, 1, -1]])
+        self.assertTrue(torch.isfinite(z.grad).all())
+
+    def test_quantization_weight_selection(self):
+        candidates = [{"bits": 16, "method": "quantization", "penalty_weight": w,
+                       "validation_precision_at_10": score,
+                       "median_binary": {"validation_precision_at_10": 1 - score}}
+                      for w, score in [(0.001, 0.2), (0.01, 0.6), (0.1, 0.4)]]
+        self.assertEqual(select_weights(candidates, [16], ["quantization"]), {"16": {"quantization": 0.01}})
+
+    def test_quantization_variant_saves_zero_threshold_model(self):
+        rng = np.random.default_rng(9)
+        train = rng.random((16, 784), dtype=np.float32)
+        validation = rng.random((8, 784), dtype=np.float32)
+        data = (train, validation, validation, np.arange(16) % 2, np.arange(8) % 2)
+        args = SimpleNamespace(epochs=1, batch_size=8, device="cpu")
+        with tempfile.TemporaryDirectory() as root:
+            result = run_variant(data, 4, "quantization", 0.01, args, 42, "validation", Path(root) / "model")
+            self.assertEqual(result["artifact_roundtrip"], "passed")
+            self.assertEqual(result["threshold_rule"], "zero")
+            self.assertIn("validation_precision_at_10", result)
+            self.assertNotIn("test_precision_at_10", result)
+            self.assertIn("validation_precision_at_10", result["median_binary"])
+            _, arrays = load_artifact(Path(root) / "model")
+            np.testing.assert_array_equal(arrays["binary_thresholds"], np.zeros(4))
+
     def test_continuous_search_matches_direct_distances(self):
         rng = np.random.default_rng(12)
         database = rng.normal(size=(31, 5))

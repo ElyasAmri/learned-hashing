@@ -67,6 +67,10 @@ def separation_penalty(latent, penalty, generator):
     return (distances + 1e-3).reciprocal().mean()
 
 
+def quantization_penalty(latent):
+    return (latent.abs() - 1).square().mean()
+
+
 def train_autoencoder(train, validation, bits, epochs, batch_size, device, seed,
                       penalty=None, penalty_weight=0.0):
     torch.manual_seed(seed)
@@ -87,8 +91,9 @@ def train_autoencoder(train, validation, bits, epochs, batch_size, device, seed,
                 loss = nn.functional.mse_loss(model(batch), batch)
             else:
                 latent = model.encoder(batch)
-                loss = (nn.functional.mse_loss(model.decoder(latent), batch)
-                        + penalty_weight * separation_penalty(latent, penalty, pair_generator))
+                regularizer = (quantization_penalty(latent) if penalty == "quantization"
+                               else separation_penalty(latent, penalty, pair_generator))
+                loss = nn.functional.mse_loss(model.decoder(latent), batch) + penalty_weight * regularizer
             if not torch.isfinite(loss):
                 raise FloatingPointError("Non-finite training loss")
             loss.backward()

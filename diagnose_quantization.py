@@ -53,9 +53,11 @@ def continuous_neighbors(database, queries, metric, k=10, batch_size=64):
     return np.stack(neighbors)
 
 
-def save_artifact(directory, method, model, mean, thresholds, rotation):
+def save_artifact(directory, method, model, mean, thresholds, rotation, binary_thresholds=None):
     directory.mkdir(parents=True, exist_ok=False)
     arrays = {"method": method, "latent_mean": mean, "median_thresholds": thresholds, "rotation": rotation}
+    if binary_thresholds is not None:
+        arrays["binary_thresholds"] = binary_thresholds
     if method == "pca":
         arrays.update({"input_mean": model.mean_, "components": model.components_})
     else:

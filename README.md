@@ -43,7 +43,7 @@ Code diagnostics: unique codes, duplicate-item fraction `(N - unique_codes) / N`
 
 Storage: packed database bytes and inference-parameter bytes (encoder/projection, centering where applicable, and thresholds). These exclude labels, index metadata, runtime objects, and the autoencoder decoder. Float-valued latent vectors are not counted as binary hashes.
 
-Timing: fit including threshold calibration, database encoding, query encoding, and exact search. These are single-run wall times, not controlled performance benchmarks. JSON includes configuration, library versions, and autoencoder validation history. The original pilot and penalty runners do not save trained models; the quantization diagnostic below does.
+Timing: fit including threshold calibration, database encoding, query encoding, and exact search. These are single-run wall times, not controlled performance benchmarks. JSON includes configuration, library versions, and autoencoder validation history. The original pilot does not save models; the penalty runner saves selected models with `--save-models`, and the quantization diagnostic always saves them.
 
 ## Separation penalties
 
@@ -53,7 +53,7 @@ Timing: fit including threshold calibration, database encoding, query encoding, 
 .venv/Scripts/python penalty_experiment.py --stage test
 ```
 
-The runner also supports `--stage all` (default). Use `--output-dir` for a fresh run; existing reports are never overwritten. Test-only runs load `tuning.json` from that directory and check training settings and library versions. `--seeds` can select remaining test seeds after an interrupted run.
+The runner also supports `--stage all` (default). Use `--output-dir` for a fresh run; existing reports are never overwritten. Test-only runs load `tuning.json` from that directory and check training settings, penalty selection, and library versions. `--seeds` can select remaining evaluation seeds after an interrupted run. `--query-split validation` keeps final evaluation on validation data even when the stage is named `test`. `--penalties` selects which losses to run; defaults remain the two reciprocal-distance penalties.
 
 Both variants minimize `reconstruction_MSE + weight * mean(1 / (0.001 + distance))`. Distances compare `softmax(z)` distributions (temperature 1), not raw latent-vector geometry:
 
@@ -64,7 +64,7 @@ Each minibatch uses a seeded random cycle to pair distinct samples without self-
 
 Weights `1e-6`, `1e-5`, `1e-4`, and `1e-3` are selected separately per penalty and bit length using precision@10 on the first 2,000 validation images at seed 42, against all 50,000 training/database images. Each candidate trains for 20 epochs. Ties favor the smaller weight. No test images are loaded during tuning. Selected weights are fixed for test seeds 42, 7, 21, 84, and 123. Validation labels therefore tune these variants, although they do not enter gradient training; the original baselines did not receive a comparable weight search.
 
-Softmax does not bound KL divergence: sharpening logits can increase it. Wasserstein here is bounded by 1. Neither objective guarantees semantic separation or uniform binary codes, and both repel same-class as well as different-class pairs. Identical distributions have zero separation gradient despite the reciprocal penalty being high. Reports retain every tuning score, selected weight, test metric, and reconstruction history, but not model weights.
+Softmax does not bound KL divergence: sharpening logits can increase it. Wasserstein here is bounded by 1. Neither objective guarantees semantic separation or uniform binary codes, and both repel same-class as well as different-class pairs. Identical distributions have zero separation gradient despite the reciprocal penalty being high. Reports retain every tuning score, selected weight, evaluation metric, and reconstruction history. The original reciprocal-distance runs did not save models.
 
 ## Five-seed results
 
@@ -138,6 +138,30 @@ Completed reports and artifacts are in `results/quantization-v2/`. Each seed has
 
 Every completed artifact was reloaded and checked against all 10,000 validation query encodings and both median/ITQ codes. An initial run in `results/quantization/` stopped on one changed PCA bit after reload: identical coefficients with a different memory layout changed float32 rounding near a threshold. PCA components now use a contiguous layout before encoding and saving; the full rerun passed all 30 round trips. The interrupted directory remains intact and is not part of the result table.
 
+## Quantization-aware training: validation only
+
+```powershell
+.venv/Scripts/python penalty_experiment.py --penalties quantization --query-split validation --save-models --weights 0.001 0.01 0.1 1.0 --output-dir results/qat-next
+```
+
+The architecture and decoder inputs remain unchanged. Training adds `weight * mean((abs(z) - 1)^2)` to reconstruction MSE, encouraging raw latent coordinates toward either binary target. This is soft quantization regularization, not a hard binary bottleneck or a straight-through estimator. It does not enforce bit balance or decorrelation; the absolute-value implementation has zero gradient at exactly zero.
+
+Weights are selected separately for each bit length using **zero-threshold** precision@10 on the first 2,000 validation images at seed 42. The grid is `0.001, 0.01, 0.1, 1.0`; ties favor smaller weights. Checkpoints still minimize validation reconstruction MSE. Selected weights are fixed for five seeds and all 10,000 validation queries. Median-threshold retrieval is a prespecified secondary diagnostic, not used to choose weights. No official test images are loaded. These are development results: the final validation queries overlap tuning and checkpoint selection, and the baselines did not receive a comparable loss-weight search.
+
+The run took 10 minutes 25 seconds: 12 tuning candidates and 15 selected-weight models, each trained for 20 epochs. The smallest weight, `0.001`, was selected at all three bit lengths, so smaller weights remain unexplored. Mean +/- sample standard deviation of validation precision@10 (%):
+
+| Bits | PCA median | Plain AE median | AE + ITQ | Quantization AE zero (primary) | Quantization AE median (diagnostic) |
+|---|---:|---:|---:|---:|---:|
+| 16 | 66.38 +/- 0.33 | 62.42 +/- 1.43 | 62.67 +/- 1.50 | 64.95 +/- 1.29 | 67.06 +/- 0.72 |
+| 32 | 73.54 +/- 0.26 | 70.87 +/- 0.73 | 71.76 +/- 0.71 | 69.14 +/- 0.64 | 73.18 +/- 0.62 |
+| 64 | 77.49 +/- 0.47 | 75.90 +/- 0.23 | 76.43 +/- 0.56 | 73.39 +/- 0.67 | 77.27 +/- 0.60 |
+
+The first three columns reuse `results/quantization-v2/`. Primary zero-threshold retrieval changed by +2.52, -1.73, and -2.50 points relative to the plain median-code AE. No primary run beat PCA. With median thresholds, the regularized AE improved over the plain AE in all five seeds at each bit length; mean gains were +4.64, +2.32, and +1.38 points. It beat PCA in 4/5 seeds at 16 bits and 2/5 seeds at 32 and 64 bits; the 16-bit mean advantage was 0.68 points, not a significance claim.
+
+At weights 0.1 and 1.0, every database item received the same zero-threshold code at all three bit lengths during tuning (9.865% precision@10). Even at the selected weight, mean absolute bit imbalance from 50% was 0.187, 0.235, and 0.254 for 16/32/64-bit zero-threshold codes. Pulling values toward binary targets alone does not ensure useful or balanced codes. The median diagnostic is promising but does not change the mixed primary outcome.
+
+Reports are in `results/qat/`; selected models are in `results/qat/models/seed-{seed}/quantization-{bits}/`. Use `load_artifact` to obtain the encoder and arrays. Primary codes are `z > binary_thresholds` (saved zeros); diagnostic codes are `z > median_thresholds`. These artifacts contain an identity rotation only for format compatibility, not a fitted ITQ transform. All 15 artifacts passed reload checks on all 10,000 query encodings and both code types. Tuning candidates were not saved.
+
 ## Next decision
 
-Keep PCA with median thresholds as the strongest binary baseline here. For the autoencoder, test quantization-aware training or bit decorrelation next: its continuous representation is useful, but this ITQ configuration does not close the binary-retrieval gap. Choose changes using validation data, not the already-inspected test results. Larger benchmarks and an unseen retrieval database remain necessary; Fashion-MNIST alone does not support a state-of-the-art claim.
+Test smaller quantization weights with median thresholds fixed in advance, or a separate balance-loss ablation, using validation data. The weak quantization penalty plus median thresholds improved the AE; stronger penalties caused collapse, and zero thresholds lost quality at 32/64 bits. Do not change the architecture yet or tune against the already-inspected test results. Larger benchmarks and an unseen retrieval database remain necessary; Fashion-MNIST alone does not support a state-of-the-art claim.
