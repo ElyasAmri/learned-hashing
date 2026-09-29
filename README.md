@@ -16,7 +16,14 @@ python -m venv .venv
 .venv/Scripts/python experiment.py --output results/pilot.json
 ```
 
-The first experiment run downloads Fashion-MNIST into `data/`. Reports go to ignored `results/`; use a fresh output filename for each run. CPU is the default. `--device cuda` moves only the autoencoder to CUDA and requires a compatible PyTorch installation. Exact Hamming search stays on the CPU and may dominate full-run time.
+The first experiment run downloads Fashion-MNIST into `data/`. Reports go to ignored `results/`; use a fresh output filename for each run. CPU is the default. On this RTX 5080 machine, install the tested CUDA 12.8 wheels into the existing environment, then run:
+
+```powershell
+.venv/Scripts/python -m pip install torch==2.11.0+cu128 torchvision==0.26.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+.venv/Scripts/python experiment.py --device cuda --output results/pilot-gpu.json
+```
+
+Only autoencoder training and encoding use CUDA. PCA, random projections, and exact Hamming search stay on the CPU.
 
 ## Protocol
 
@@ -37,6 +44,18 @@ Code diagnostics: unique codes, duplicate-item fraction `(N - unique_codes) / N`
 Storage: packed database bytes and inference-parameter bytes (encoder/projection, centering where applicable, and thresholds). These exclude labels, index metadata, runtime objects, and the autoencoder decoder. Float-valued latent vectors are not counted as binary hashes.
 
 Timing: fit including threshold calibration, database encoding, query encoding, and exact search. These are single-run wall times, not controlled performance benchmarks. JSON includes configuration, library versions, and autoencoder validation history; it does not save trained models.
+
+## First full run
+
+Seed 42, default splits and 20 epochs, RTX 5080 / Ryzen 9 9950X. Total wall time was 2 minutes 26 seconds. Environment: torch 2.11.0+cu128, torchvision 0.26.0+cu128, numpy 2.2.6, scikit-learn 1.7.2. Detailed local report: `results/pilot-gpu.json`.
+
+| Bits | Random precision@10 | PCA precision@10 | Autoencoder precision@10 | PCA unique codes | Autoencoder unique codes |
+|---|---:|---:|---:|---:|---:|
+| 16 | 49.874% | 65.592% | 61.549% | 11,695 | 4,937 |
+| 32 | 62.209% | 73.032% | 69.888% | 46,393 | 29,406 |
+| 64 | 68.643% | 76.652% | 75.351% | 49,974 | 47,458 |
+
+PCA led retrieval quality at every bit budget in this single-seed run. The autoencoder beat random projections but used fewer distinct codes than PCA. This does not establish statistical significance or show that collisions caused the quality gap. Models were not saved; the report retains metrics and validation histories.
 
 ## Next decision
 
