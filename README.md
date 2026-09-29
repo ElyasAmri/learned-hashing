@@ -45,18 +45,28 @@ Storage: packed database bytes and inference-parameter bytes (encoder/projection
 
 Timing: fit including threshold calibration, database encoding, query encoding, and exact search. These are single-run wall times, not controlled performance benchmarks. JSON includes configuration, library versions, and autoencoder validation history; it does not save trained models.
 
-## First full run
+## Five-seed results
 
-Seed 42, default splits and 20 epochs, RTX 5080 / Ryzen 9 9950X. Total wall time was 2 minutes 26 seconds. Environment: torch 2.11.0+cu128, torchvision 0.26.0+cu128, numpy 2.2.6, scikit-learn 1.7.2. Detailed local report: `results/pilot-gpu.json`.
+Seeds 42, 7, 21, 84, and 123; default splits and 20 epochs; RTX 5080 / Ryzen 9 9950X. The first run took 2 minutes 26 seconds; four additional runs took 8 minutes 27 seconds combined. Environment: torch 2.11.0+cu128, torchvision 0.26.0+cu128, numpy 2.2.6, scikit-learn 1.7.2. Local reports: `results/pilot-gpu.json` (42) and `results/pilot-gpu-seed-{seed}.json` (others).
 
-| Bits | Random precision@10 | PCA precision@10 | Autoencoder precision@10 | PCA unique codes | Autoencoder unique codes |
-|---|---:|---:|---:|---:|---:|
-| 16 | 49.874% | 65.592% | 61.549% | 11,695 | 4,937 |
-| 32 | 62.209% | 73.032% | 69.888% | 46,393 | 29,406 |
-| 64 | 68.643% | 76.652% | 75.351% | 49,974 | 47,458 |
+Precision@10 below is mean +/- sample standard deviation across five runs, in percent; deviations and paired gaps are in percentage points.
 
-PCA led retrieval quality at every bit budget in this single-seed run. The autoencoder beat random projections but used fewer distinct codes than PCA. This does not establish statistical significance or show that collisions caused the quality gap. Models were not saved; the report retains metrics and validation histories.
+| Bits | Random precision@10 | PCA precision@10 | Autoencoder precision@10 | Paired PCA minus autoencoder |
+|---|---:|---:|---:|---:|
+| 16 | 51.24 +/- 1.28 | 65.63 +/- 0.11 | 61.86 +/- 1.32 | 3.77 +/- 1.34 |
+| 32 | 62.95 +/- 0.48 | 72.99 +/- 0.11 | 70.17 +/- 0.53 | 2.83 +/- 0.59 |
+| 64 | 70.47 +/- 1.33 | 76.78 +/- 0.10 | 75.20 +/- 0.22 | 1.58 +/- 0.29 |
+
+PCA beat the autoencoder, and the autoencoder beat random projections, in all five runs at each bit budget. Code diagnostics averaged over seeds:
+
+| Bits | PCA unique codes | Autoencoder unique codes | PCA mean absolute bit correlation | Autoencoder mean absolute bit correlation |
+|---|---:|---:|---:|---:|
+| 16 | 11,744.4 | 5,012.6 | 0.045 | 0.221 |
+| 32 | 46,424.8 | 28,339.8 | 0.027 | 0.216 |
+| 64 | 49,973.8 | 46,724.0 | 0.017 | 0.211 |
+
+Changing the seed changes the training/validation split, database row order for Hamming ties, and model randomness together. All runs use the same official test images, so these are repeatability measurements, not independent test datasets or confidence intervals. More correlated autoencoder bits and fewer unique codes do not establish the cause of the retrieval gap. Models were not saved; reports retain metrics and validation histories.
 
 ## Next decision
 
-Compare quality at each bit budget before adding losses or architecture complexity. If PCA matches or beats the autoencoder, nonlinear reconstruction has not justified itself. If codes are redundant, investigate balance/decorrelation; if binarization destroys useful neighborhoods, investigate quantization-aware training. Repeat across seeds before drawing conclusions. Then add an unseen retrieval database and larger benchmarks with established learned-hashing methods. Fashion-MNIST alone does not support a state-of-the-art claim.
+The reconstruction-only autoencoder has not justified itself over PCA in this pilot. Next, compare PCA and autoencoder continuous-latent retrieval against their binary-code retrieval to isolate losses introduced by thresholding. Use validation queries against the training database for this diagnostic and subsequent tuning, not the already-inspected test results. If binarization is the main loss, test quantization-aware training or decorrelation in separate ablations before increasing architecture complexity. Larger benchmarks and an unseen retrieval database remain necessary; Fashion-MNIST alone does not support a state-of-the-art claim.
