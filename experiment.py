@@ -46,7 +46,29 @@ def reconstruction_mse(model, x, device, batch_size=1024):
     return total / x.size
 
 
-def train_autoencoder(train, validation, bits, epochs, batch_size, device, seed):
+def pair_distances(left, right, penalty):
+    left_log = nn.functional.log_softmax(left, dim=1)
+    right_log = nn.functional.log_softmax(right, dim=1)
+    left_p, right_p = left_log.exp(), right_log.exp()
+    if penalty == "inverse_kl":
+        return (0.5 * ((left_p - right_p) * (left_log - right_log)).sum(dim=1)).clamp_min(0)
+    if penalty == "inverse_wasserstein":
+        # W1 on equally spaced bins in [0, 1]; the mean accounts for bin spacing.
+        return (left_p - right_p).cumsum(dim=1)[:, :-1].abs().mean(dim=1)
+    raise ValueError(f"Unknown penalty: {penalty}")
+
+
+def separation_penalty(latent, penalty, generator):
+    if len(latent) < 2:
+        return latent.sum() * 0
+    # A randomly ordered cycle has no self-pairs, unlike a random permutation.
+    order = torch.randperm(len(latent), generator=generator).to(latent.device)
+    distances = pair_distances(latent[order], latent[order.roll(1)], penalty)
+    return (distances + 1e-3).reciprocal().mean()
+
+
+def train_autoencoder(train, validation, bits, epochs, batch_size, device, seed,
+                      penalty=None, penalty_weight=0.0):
     torch.manual_seed(seed)
     model = Autoencoder(bits).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -55,12 +77,20 @@ def train_autoencoder(train, validation, bits, epochs, batch_size, device, seed)
     best_loss = float("inf")
     best_state = None
     history = []
+    pair_generator = torch.Generator().manual_seed(seed)
     for epoch in range(epochs):
         model.train()
         for (batch,) in loader:
             batch = batch.to(device)
             optimizer.zero_grad()
-            loss = nn.functional.mse_loss(model(batch), batch)
+            if penalty is None or penalty_weight == 0:
+                loss = nn.functional.mse_loss(model(batch), batch)
+            else:
+                latent = model.encoder(batch)
+                loss = (nn.functional.mse_loss(model.decoder(latent), batch)
+                        + penalty_weight * separation_penalty(latent, penalty, pair_generator))
+            if not torch.isfinite(loss):
+                raise FloatingPointError("Non-finite training loss")
             loss.backward()
             optimizer.step()
         val_loss = reconstruction_mse(model, validation, device)
@@ -127,22 +157,30 @@ def evaluate(database_codes, query_codes, database_labels, query_labels, k):
     }
 
 
-def load_data(root, seed, train_size, validation_size, query_size):
+def load_data(root, seed, train_size, validation_size, query_size, query_split="test"):
     official_train = FashionMNIST(root, train=True, download=True)
-    official_test = FashionMNIST(root, train=False, download=True)
     rng = np.random.default_rng(seed)
     order = rng.permutation(len(official_train))
     # Keep validation disjoint and fixed even when reducing the training size.
     train_ids = order[:train_size]
     validation_ids = order[50000:50000 + validation_size]
-    query_ids = rng.permutation(len(official_test))[:query_size]
+    if query_split == "validation":
+        if query_size > validation_size:
+            raise ValueError("Validation queries exceed validation size")
+        query_dataset = official_train
+        query_ids = validation_ids[:query_size]
+    elif query_split == "test":
+        query_dataset = FashionMNIST(root, train=False, download=True)
+        query_ids = rng.permutation(len(query_dataset))[:query_size]
+    else:
+        raise ValueError(f"Unknown query split: {query_split}")
 
     def images(dataset, ids):
         return dataset.data[ids].numpy().reshape(len(ids), 784).astype(np.float32) / 255.0
 
     return (images(official_train, train_ids), images(official_train, validation_ids),
-            images(official_test, query_ids), official_train.targets[train_ids].numpy(),
-            official_test.targets[query_ids].numpy())
+            images(query_dataset, query_ids), official_train.targets[train_ids].numpy(),
+            query_dataset.targets[query_ids].numpy())
 
 
 def main():
