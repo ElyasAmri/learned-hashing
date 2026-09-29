@@ -43,7 +43,7 @@ Code diagnostics: unique codes, duplicate-item fraction `(N - unique_codes) / N`
 
 Storage: packed database bytes and inference-parameter bytes (encoder/projection, centering where applicable, and thresholds). These exclude labels, index metadata, runtime objects, and the autoencoder decoder. Float-valued latent vectors are not counted as binary hashes.
 
-Timing: fit including threshold calibration, database encoding, query encoding, and exact search. These are single-run wall times, not controlled performance benchmarks. JSON includes configuration, library versions, and autoencoder validation history; it does not save trained models.
+Timing: fit including threshold calibration, database encoding, query encoding, and exact search. These are single-run wall times, not controlled performance benchmarks. JSON includes configuration, library versions, and autoencoder validation history. The original pilot and penalty runners do not save trained models; the quantization diagnostic below does.
 
 ## Separation penalties
 
@@ -104,8 +104,40 @@ Mean unique database codes across seeds:
 
 Both penalties modestly increased average code utilization, but neither reliably improved precision in every seed. At 64 bits, mean absolute bit correlation was 0.017 for PCA, 0.211 for the plain autoencoder, 0.208 for inverse KL, and 0.207 for inverse Wasserstein.
 
-Changing the seed changes the training/validation split, database row order for Hamming ties, and model randomness together. All runs use the same official test images, so these are repeatability measurements, not independent test datasets or confidence intervals. More correlated autoencoder bits and fewer unique codes do not establish the cause of the retrieval gap. Models were not saved; reports retain metrics and validation histories.
+Changing the seed changes the training/validation split, database row order for Hamming ties, and model randomness together. All runs use the same official test images, so these are repeatability measurements, not independent test datasets or confidence intervals. More correlated autoencoder bits and fewer unique codes do not establish the cause of the retrieval gap. These earlier experiments did not save models; reports retain metrics and validation histories.
+
+## Quantization diagnostic: validation only
+
+```powershell
+.venv/Scripts/python diagnose_quantization.py --output-dir results/quantization-next
+```
+
+Uses the same five seeds, 50,000 training/database images, 10,000 validation queries, and 20 autoencoder epochs. No official test images are loaded. These queries also select autoencoder checkpoints by reconstruction MSE; results are development diagnostics, not fresh test estimates. The plain PCA and autoencoder are fitted once per seed and bit length, then reused for all five retrieval variants:
+
+- Continuous Euclidean and cosine retrieval: subtract the training latent mean for both; centering leaves Euclidean distances unchanged but changes cosine distances. Exact search uses float64 arithmetic and breaks ties by database row index. No whitening or row normalization is applied before Euclidean search.
+- Median binary: the original training-median threshold rule.
+- Centered sign: zero-threshold codes after training-mean centering, without rotation. This controls for ITQ's threshold change.
+- ITQ binary: 50 alternating sign/orthogonal-Procrustes iterations on centered training latents, starting from a seeded random orthogonal rotation, then zero-threshold codes. No per-coordinate scaling or whitening; neither validation data nor labels fit the rotation. Orthogonal rotations preserve Euclidean distances before binarization.
+
+All search and ITQ work runs on CPU; autoencoder training/encoding uses CUDA. Continuous representations use float coordinates, not the same storage budget as binary codes. Continuous-to-binary gaps compare both representation and retrieval metric, not an isolated information-loss measurement.
+
+The completed run took 22 minutes 5 seconds. Mean +/- sample standard deviation of **validation precision@10 (%)** across five seeds:
+
+| Bits | Encoder | Continuous Euclidean | Continuous cosine | Median binary | Centered sign | ITQ binary |
+|---|---|---:|---:|---:|---:|---:|
+| 16 | PCA | 78.49 +/- 0.26 | 79.09 +/- 0.31 | 66.38 +/- 0.33 | 66.54 +/- 0.34 | 64.80 +/- 0.52 |
+| 16 | AE | 79.66 +/- 0.34 | 79.93 +/- 0.36 | 62.42 +/- 1.43 | 61.87 +/- 0.96 | 62.67 +/- 1.50 |
+| 32 | PCA | 80.43 +/- 0.36 | 81.02 +/- 0.34 | 73.54 +/- 0.26 | 73.62 +/- 0.28 | 71.73 +/- 0.52 |
+| 32 | AE | 80.62 +/- 0.26 | 81.17 +/- 0.30 | 70.87 +/- 0.73 | 70.57 +/- 0.52 | 71.76 +/- 0.71 |
+| 64 | PCA | 81.19 +/- 0.33 | 81.86 +/- 0.32 | 77.49 +/- 0.47 | 77.48 +/- 0.37 | 76.29 +/- 0.28 |
+| 64 | AE | 81.08 +/- 0.35 | 81.61 +/- 0.33 | 75.90 +/- 0.23 | 75.60 +/- 0.42 | 76.43 +/- 0.56 |
+
+AE continuous retrieval was competitive with PCA, but its median-code gap was larger, especially at 16 bits (17.51 points below centered cosine versus PCA's 12.71). ITQ improved AE over median codes by 0.25, 0.90, and 0.53 points on average; it won in 2/5, 4/5, and 5/5 seeds respectively. PCA ITQ lost to median codes in every seed. Quantization objective values decreased in all 30 fits, showing that reducing that objective alone does not guarantee better category retrieval. The earlier penalty search used a coarse grid and did not close the gap to PCA; it was not an exhaustive optimization.
+
+Completed reports and artifacts are in `results/quantization-v2/`. Each seed has a JSON report plus `seed-{seed}/{method}-{bits}/transform.npz`; AE directories also contain `autoencoder.pt` with the selected full state dict. NPZ files hold training latent means, median thresholds, ITQ rotations, and PCA input means/components. Input preprocessing is still flattened float32 pixels in `[0, 1]`. `load_artifact(directory, device)` in `diagnose_quantization.py` returns an encoder callable and these arrays. Encode new inputs, then use either `z > median_thresholds` or `(z - latent_mean) @ rotation > 0`.
+
+Every completed artifact was reloaded and checked against all 10,000 validation query encodings and both median/ITQ codes. An initial run in `results/quantization/` stopped on one changed PCA bit after reload: identical coefficients with a different memory layout changed float32 rounding near a threshold. PCA components now use a contiguous layout before encoding and saving; the full rerun passed all 30 round trips. The interrupted directory remains intact and is not part of the result table.
 
 ## Next decision
 
-The reciprocal-distance penalties did not close the gap to PCA; increasing their weights blindly is not supported by this sweep. The selected 64-bit KL weight lies at the lower search boundary, and selection used only one seed and a coarse four-weight grid, so this is not an exhaustive optimization. Next, compare continuous-latent retrieval against binary-code retrieval on validation queries before deciding whether to change the representation objective or the quantization. Do not tune against the already-inspected test results. Larger benchmarks and an unseen retrieval database remain necessary; Fashion-MNIST alone does not support a state-of-the-art claim.
+Keep PCA with median thresholds as the strongest binary baseline here. For the autoencoder, test quantization-aware training or bit decorrelation next: its continuous representation is useful, but this ITQ configuration does not close the binary-retrieval gap. Choose changes using validation data, not the already-inspected test results. Larger benchmarks and an unseen retrieval database remain necessary; Fashion-MNIST alone does not support a state-of-the-art claim.

@@ -1,9 +1,13 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 import torch
+from sklearn.decomposition import PCA
 
+from diagnose_quantization import continuous_neighbors, fit_itq, load_artifact, save_artifact
 from experiment import (Autoencoder, code_statistics, encode, evaluate, load_data,
                         hamming_neighbors, pair_distances, quantize, separation_penalty,
                         train_autoencoder)
@@ -132,6 +136,74 @@ class HashingTests(unittest.TestCase):
             model, history = train_autoencoder(train, validation, 4, 2, 8, "cpu", 42, penalty, 1e-4)
             self.assertTrue(np.isfinite(history).all())
             self.assertTrue(np.isfinite(encode(model, validation, "cpu")).all())
+
+
+class QuantizationTests(unittest.TestCase):
+    def test_continuous_search_matches_direct_distances(self):
+        rng = np.random.default_rng(12)
+        database = rng.normal(size=(31, 5))
+        database[1] = database[0]
+        queries = np.concatenate([database[:2], rng.normal(size=(5, 5))])
+        for metric in ["euclidean", "cosine"]:
+            if metric == "euclidean":
+                distances = np.square(queries[:, None] - database[None]).sum(axis=2)
+            else:
+                d = database / np.linalg.norm(database, axis=1, keepdims=True)
+                q = queries / np.linalg.norm(queries, axis=1, keepdims=True)
+                distances = 1 - q @ d.T
+            expected = np.argsort(distances, axis=1, kind="stable")[:, :10]
+            np.testing.assert_array_equal(continuous_neighbors(database, queries, metric, 10, 3), expected)
+
+    def test_continuous_ties_and_zero_vectors(self):
+        database = np.zeros((20, 4))
+        queries = np.zeros((3, 4))
+        for metric in ["euclidean", "cosine"]:
+            np.testing.assert_array_equal(continuous_neighbors(database, queries, metric),
+                                          np.tile(np.arange(10), (3, 1)))
+
+    def test_itq_is_orthogonal_and_reduces_objective(self):
+        rng = np.random.default_rng(7)
+        latent = rng.normal(size=(200, 8)) * np.arange(1, 9) + 5
+        mean, rotation, history = fit_itq(latent, 15, 42)
+        np.testing.assert_allclose(mean, latent.mean(axis=0))
+        np.testing.assert_allclose(rotation.T @ rotation, np.eye(8), atol=1e-12)
+        self.assertTrue((np.diff(history) <= 1e-10).all())
+        self.assertLess(history[-1], history[0])
+        centered = latent - mean
+        np.testing.assert_allclose(np.linalg.norm(centered[:5] - centered[5:10], axis=1),
+                                   np.linalg.norm((centered[:5] - centered[5:10]) @ rotation, axis=1))
+        repeated = fit_itq(latent, 15, 42)
+        np.testing.assert_array_equal(rotation, repeated[1])
+
+    def test_pca_and_autoencoder_artifacts_reproduce_codes(self):
+        rng = np.random.default_rng(42)
+        train = rng.random((24, 784), dtype=np.float32)
+        queries = rng.random((9, 784), dtype=np.float32)
+        with tempfile.TemporaryDirectory() as root:
+            for method in ["pca", "autoencoder"]:
+                if method == "pca":
+                    model = PCA(n_components=4, svd_solver="randomized", random_state=42).fit(train)
+                    model.components_ = np.ascontiguousarray(model.components_)
+                    transform = model.transform
+                else:
+                    model = Autoencoder(4)
+                    transform = lambda x: encode(model, x, "cpu")
+                latent = transform(train)
+                original = transform(queries)
+                thresholds = np.median(latent, axis=0)
+                mean, rotation, _ = fit_itq(latent, 3, 42)
+                path = Path(root) / method
+                save_artifact(path, method, model, mean, thresholds, rotation)
+                restored, saved = load_artifact(path)
+                actual = restored(queries)
+                np.testing.assert_allclose(actual, original, rtol=1e-5, atol=1e-5)
+                if method == "pca":
+                    np.testing.assert_array_equal(actual, original)
+                np.testing.assert_array_equal(actual > saved["median_thresholds"], original > thresholds)
+                np.testing.assert_array_equal((actual - saved["latent_mean"]) @ saved["rotation"] > 0,
+                                              (original - mean) @ rotation > 0)
+                with self.assertRaises(FileExistsError):
+                    save_artifact(path, method, model, mean, thresholds, rotation)
 
 
 if __name__ == "__main__":
