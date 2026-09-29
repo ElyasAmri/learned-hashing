@@ -1,0 +1,1 @@
+Use the encoder from auto-encoders to map data into the latent space to use as hashing and compare against SoTA in terms of collision rate and space utilization in terms of representation.
