@@ -214,7 +214,7 @@ Reports, the pre-run protocol, and all 45 fitted model/transform artifacts are i
 .venv/Scripts/python benchmark_transfer.py --unseen-database-from results/kmnist-frozen --output-dir results/kmnist-unseen-next
 ```
 
-This mode only loads saved models; it does not train, fit PCA, select checkpoints, or recalibrate thresholds. For each seed, the original seeded KMNIST test permutation is split into its first 5,000 images as the unseen database and last 5,000 as queries. The query and unseen-database IDs are disjoint. A matched control uses the first 5,000 images from that model's training permutation as the database, against the exact same query codes. All thresholds remain medians from the original 50,000 training images.
+Without `--itq-and-costs`, this mode only loads saved models; it does not train, fit PCA, select checkpoints, or recalibrate thresholds. For each seed, the original seeded KMNIST test permutation is split into its first 5,000 images as the unseen database and last 5,000 as queries. The query and unseen-database IDs are disjoint. A matched control uses the first 5,000 images from that model's training permutation as the database, against the exact same query codes. All thresholds remain medians from the original 50,000 training images.
 
 The protocol is written before evaluation, including source-protocol and artifact SHA-256 hashes. Seed reports save the official split, row IDs, and class counts of all three partitions. `completion.json` records that all 75 source files (45 transforms and 30 AE state dicts) remained unchanged. The run evaluated 45 saved models against both databases in 65 seconds, without creating new model artifacts. Reports are in `results/kmnist-unseen/`.
 
@@ -236,6 +236,54 @@ On the unseen database, quantization AE beat PCA in all five seeds at every bit 
 
 All methods scored higher on the unseen database than on the matched training control. Both unseen database and queries come from the official test split, whereas the control database comes from the official training split. Equal sizes and shared queries control database size and query identity, not differences in split distributions, class composition, or sampling; the gap cannot be attributed solely to training exposure. These are follow-up diagnostics on a previously inspected test pool, not a new untouched benchmark. Query pools overlap across seeds, and these deviations are not confidence intervals over independent datasets. Do not compare these absolute scores directly with the previous 50,000-database/10,000-query results.
 
+## PCA + ITQ baseline and costs
+
+```powershell
+.venv/Scripts/python benchmark_transfer.py --unseen-database-from results/kmnist-frozen --itq-and-costs --output-dir results/kmnist-itq-costs-next
+```
+
+Existing encoders and thresholds remain frozen. PCA + ITQ adds a rotation fitted only to the original 50,000 training images projected by the saved PCA. It uses the same 50-iteration, training-mean-centered, unwhitened procedure as the earlier Fashion-MNIST diagnostic, with the run's seed and zero thresholds after rotation. There is no KMNIST weight search, iteration search, or query/database calibration. All four methods use the identical 5,000 unseen database IDs, 5,000 disjoint query IDs, and matched training-database control from the previous section.
+
+The run took 89 seconds, including 15 ITQ fits, 120 retrieval evaluations, and encoding measurements. Unseen-database precision@10 (%), mean +/- sample standard deviation across five seeds:
+
+| Bits | PCA | PCA + ITQ | Plain AE | Quantization AE |
+|---|---:|---:|---:|---:|
+| 16 | 48.72 +/- 0.34 | 56.18 +/- 1.02 | 50.00 +/- 1.17 | 52.99 +/- 0.38 |
+| 32 | 57.62 +/- 0.18 | 66.78 +/- 0.57 | 56.78 +/- 0.91 | 58.14 +/- 0.39 |
+| 64 | 60.52 +/- 0.22 | 73.77 +/- 0.42 | 64.93 +/- 0.46 | 65.03 +/- 0.45 |
+
+PCA + ITQ beat both PCA and the quantization AE in all five seeds at each bit length. Mean gains over the quantization AE were 3.19, 8.64, and 8.74 points. The matched training-database control also favored PCA + ITQ: its means were 52.65, 60.83, and 65.98%, versus 49.35, 52.53, and 57.64% for the quantization AE. All three existing methods reproduced their previous retrieval scores exactly.
+
+### Encoding and storage
+
+All methods are timed on CPU with PyTorch and BLAS/OpenMP limited to one thread. Each timed run encodes all 5,000 query images already in RAM and includes thresholding and bit packing, but excludes model loading, fitting, data I/O, and search. Two warm-up runs precede seven timed repeats; packed outputs must match across repeats. Entries below average each seed's median elapsed time. These are warm-batch implementation measurements on this Ryzen 9 9950X, not per-request latency or GPU serving comparisons. Torch thread settings are restored afterward.
+
+| Bits | PCA ms / 5,000 | PCA + ITQ ms / 5,000 | Plain AE ms / 5,000 | Quantization AE ms / 5,000 |
+|---|---:|---:|---:|---:|
+| 16 | 0.88 | 0.97 | 7.70 | 7.80 |
+| 32 | 1.31 | 2.00 | 8.10 | 7.88 |
+| 64 | 2.58 | 3.69 | 8.45 | 8.40 |
+
+Inference parameter storage includes the encoder or PCA projection, required centering, thresholds, and ITQ rotation. It excludes decoder weights, optimizer state, labels, index metadata, and working memory. PCA projections and neural parameters are float32; ITQ's centering/rotation use float64. This counts the implemented parameter representation, not an optimized/fused projection or checkpoint-file size. Both AEs have identical inference architecture and size.
+
+| Bits | PCA KiB | PCA + ITQ KiB | Either AE KiB | Packed 5,000-item database bytes |
+|---|---:|---:|---:|---:|
+| 16 | 52.13 | 54.31 | 400.63 | 10,000 |
+| 32 | 101.19 | 109.56 | 408.75 | 20,000 |
+| 64 | 199.31 | 232.06 | 425.00 | 40,000 |
+
+### Fitting cost provenance
+
+PCA/AE fitting times below are reused from `results/kmnist-frozen/`, not rerun here. They include fitting, checkpoint evaluation for AEs, training-set encoding, and threshold calibration; PCA ran on CPU and AE training on CUDA. The new ITQ column measures its additional CPU training projection and rotation fitting, excluding artifact saving. These are mean wall times across seeds from different runs, not a controlled end-to-end training benchmark. No tuning-search cost is included.
+
+| Bits | Recorded PCA fit s | Newly measured additional ITQ s | Recorded plain AE fit s | Recorded quantization AE fit s |
+|---|---:|---:|---:|---:|
+| 16 | 0.24 | 0.29 | 7.21 | 7.90 |
+| 32 | 0.28 | 0.61 | 7.22 | 8.39 |
+| 64 | 0.50 | 1.39 | 7.19 | 8.09 |
+
+Reports and the 15 new ITQ transforms are in `results/kmnist-itq-costs/`. After `load_artifact`, ITQ inference uses `saved_codes(transform, arrays, images, itq=True)` to apply the saved centering and rotation. The protocol records timing settings and source-report hashes; completion checks all 75 original model/transform files remained unchanged. ITQ artifacts passed reload comparisons against their training codes, and all 15 quantization objectives were nonincreasing within numerical tolerance. This remains a follow-up on the previously inspected KMNIST test pool, not another untouched benchmark. ITQ underperformed on the earlier Fashion-MNIST diagnostic, so this result should not be generalized to every dataset.
+
 ## Next decision
 
-Keep the recipe frozen and compare against stronger established hashing baselines under this same unseen-database protocol. The quantization AE's advantage over PCA persists without training on database images, but its extra benefit over the plain AE is not consistent at 64 bits. Do not tune against these now-inspected results or claim state-of-the-art performance from these two small datasets.
+Use PCA + ITQ as the stronger baseline to beat on this KMNIST protocol: it currently offers better retrieval, lower CPU encoding cost, and smaller inference parameters than either AE. Further reconstruction-based AE complexity is not justified by these results. A learned-hashing research direction should target a similarity-aware objective and be assessed on fresh data against this baseline, rather than continue tuning this test pool.

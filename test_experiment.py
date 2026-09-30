@@ -2,13 +2,14 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 import numpy as np
 import torch
 from sklearn.decomposition import PCA
 
-from benchmark_transfer import evaluate_saved_databases, frozen_settings, run_pca, unseen_partitions
+from benchmark_transfer import (evaluate_saved_databases, fit_itq_artifact, frozen_settings,
+                                measure_cpu_encoding, run_pca, saved_codes, unseen_partitions)
 from diagnose_quantization import continuous_neighbors, fit_itq, load_artifact, save_artifact
 from experiment import (Autoencoder, code_statistics, encode, evaluate, load_data,
                         hamming_neighbors, pair_distances, quantize, quantization_penalty, separation_penalty,
@@ -361,6 +362,51 @@ class UnseenDatabaseTests(unittest.TestCase):
         self.data[5]["queries"][-1] = self.data[5]["queries"][0]
         with self.assertRaisesRegex(ValueError, "IDs overlap"):
             unseen_partitions(self.data)
+
+    def test_saved_itq_codes_apply_centering_and_rotation(self):
+        images = np.array([[1., 2.], [3., 4.]])
+        arrays = {"binary_thresholds": np.zeros(2), "latent_mean": np.ones(2),
+                  "rotation": np.array([[0., -1.], [1., 0.]])}
+        np.testing.assert_array_equal(saved_codes(lambda x: x, arrays, images, itq=True),
+                                      [[True, False], [True, False]])
+        np.testing.assert_array_equal(saved_codes(lambda x: x, arrays, images), images > 0)
+
+    def test_itq_artifact_fits_training_latents_and_keeps_source(self):
+        train, validation, queries, labels, query_labels, _ = self.data
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "pca"
+            destination = Path(root) / "itq"
+            run_pca((train, validation, queries, labels, query_labels), 2, 42, "test", source)
+            original_bytes = (source / "transform.npz").read_bytes()
+            transform, _ = load_artifact(source)
+            with patch("benchmark_transfer.fit_itq", wraps=fit_itq) as fitter:
+                result = fit_itq_artifact(train, source, destination, 42)
+                fitter.assert_called_once()
+                np.testing.assert_array_equal(fitter.call_args.args[0], transform(train))
+                self.assertEqual(fitter.call_args.kwargs, {"iterations": 50, "seed": 42})
+            restored, arrays = load_artifact(destination)
+            np.testing.assert_allclose(arrays["latent_mean"], transform(train).mean(axis=0, dtype=np.float64))
+            np.testing.assert_array_equal(saved_codes(restored, arrays, queries, itq=True),
+                                          (transform(queries) - arrays["latent_mean"]) @ arrays["rotation"] > 0)
+            self.assertEqual((source / "transform.npz").read_bytes(), original_bytes)
+            self.assertEqual(result["artifact_roundtrip"], "passed")
+            self.assertEqual(len(result["itq_quantization_mse_by_iteration"]), 51)
+            self.assertEqual(result["inference_parameter_bytes"], sum(arrays[key].nbytes for key in
+                ["components", "input_mean", "latent_mean", "rotation", "binary_thresholds"]))
+
+    def test_cpu_encoding_costs_include_packing_and_restore_threads(self):
+        images = self.data[0]
+        transform = Mock(side_effect=lambda x: x)
+        arrays = {"binary_thresholds": np.zeros(4)}
+        threads = torch.get_num_threads()
+        with patch("benchmark_transfer.load_artifact", return_value=(transform, arrays)) as loader:
+            result = measure_cpu_encoding(Path("unused"), images)
+            loader.assert_called_once_with(Path("unused"), "cpu")
+        self.assertEqual(transform.call_count, 9)
+        self.assertEqual(torch.get_num_threads(), threads)
+        self.assertEqual(len(result["cpu_encode_seconds_by_repeat"]), 7)
+        self.assertGreater(result["cpu_encode_median_seconds"], 0)
+        self.assertEqual(result["packed_query_bytes"], len(images))
 
     def test_saved_thresholds_and_query_codes_are_reused(self):
         partitions = unseen_partitions(self.data)

@@ -12,8 +12,9 @@ import sklearn
 import torch
 import torchvision
 from sklearn.decomposition import PCA
+from threadpoolctl import threadpool_limits
 
-from diagnose_quantization import load_artifact, save_artifact
+from diagnose_quantization import fit_itq, load_artifact, save_artifact
 from experiment import evaluate, load_data, quantize
 from penalty_experiment import run_variant, save_report
 
@@ -82,17 +83,67 @@ def unseen_partitions(data):
     }
 
 
-def evaluate_saved_databases(partitions, directory, device):
+def saved_codes(transform, saved, images, itq=False):
+    latent = transform(images)
+    if itq:
+        latent = (latent - saved["latent_mean"]) @ saved["rotation"]
+    return quantize(latent, saved["binary_thresholds"])
+
+
+def fit_itq_artifact(train, source_directory, directory, seed):
+    transform, saved = load_artifact(source_directory, "cpu")
+    start = time.perf_counter()
+    latent = transform(train)
+    projection_seconds = time.perf_counter() - start
+    start = time.perf_counter()
+    mean, rotation, history = fit_itq(latent, iterations=50, seed=seed)
+    fit_seconds = time.perf_counter() - start
+    arrays = {**saved, "latent_mean": mean, "rotation": rotation,
+              "binary_thresholds": np.zeros(latent.shape[1]), "hash_rule": "itq_centered_zero"}
+    directory.mkdir(parents=True, exist_ok=False)
+    with (directory / "transform.npz").open("xb") as output:
+        np.savez(output, **arrays)
+    restored, restored_arrays = load_artifact(directory, "cpu")
+    np.testing.assert_array_equal(saved_codes(restored, restored_arrays, train, itq=True),
+                                  (latent - mean) @ rotation > 0)
+    return {"itq_projection_seconds": projection_seconds, "itq_fit_seconds": fit_seconds,
+            "itq_quantization_mse_by_iteration": history, "artifact_roundtrip": "passed",
+            "inference_parameter_bytes": sum(arrays[key].nbytes for key in
+                ["components", "input_mean", "latent_mean", "rotation", "binary_thresholds"])}
+
+
+def measure_cpu_encoding(directory, images, itq=False):
+    transform, saved = load_artifact(directory, "cpu")
+    previous_threads = torch.get_num_threads()
+    try:
+        torch.set_num_threads(1)
+        with threadpool_limits(limits=1):
+            for _ in range(2):
+                reference = np.packbits(saved_codes(transform, saved, images, itq), axis=1)
+            seconds = []
+            for _ in range(7):
+                start = time.perf_counter()
+                packed = np.packbits(saved_codes(transform, saved, images, itq), axis=1)
+                seconds.append(time.perf_counter() - start)
+                np.testing.assert_array_equal(packed, reference)
+    finally:
+        torch.set_num_threads(previous_threads)
+    median = float(np.median(seconds))
+    return {"cpu_encode_seconds_by_repeat": seconds, "cpu_encode_median_seconds": median,
+            "cpu_encode_images_per_second": len(images) / median, "packed_query_bytes": reference.nbytes}
+
+
+def evaluate_saved_databases(partitions, directory, device, itq=False):
     transform, saved = load_artifact(directory, device)
-    # Thresholds are reused from training, never fitted to either database or queries.
-    thresholds = saved["binary_thresholds"]
-    np.testing.assert_array_equal(thresholds, saved["median_thresholds"])
+    # ITQ uses its saved zero threshold; all other methods retain training medians.
+    if not itq:
+        np.testing.assert_array_equal(saved["binary_thresholds"], saved["median_thresholds"])
     queries = partitions["queries"]
-    query_codes = quantize(transform(queries["images"]), thresholds)
+    query_codes = saved_codes(transform, saved, queries["images"], itq)
     results = {}
     for name in ["training_database", "unseen_database"]:
         database = partitions[name]
-        database_codes = quantize(transform(database["images"]), thresholds)
+        database_codes = saved_codes(transform, saved, database["images"], itq)
         metrics = evaluate(database_codes, query_codes, database["labels"], queries["labels"], 10)
         metrics["test_precision_at_10"] = metrics.pop("same_class_precision_at_10")
         results[name] = metrics
@@ -109,11 +160,18 @@ def evaluate_unseen_database(args, versions):
         raise ValueError("Unseen evaluation requires a full frozen KMNIST benchmark")
     if versions != source["versions"]:
         raise ValueError("Library versions differ from saved models")
-    methods = ["pca", "autoencoder", "quantization"]
+    base_methods = ["pca", "autoencoder", "quantization"]
+    methods = ["pca", "pca_itq", "autoencoder", "quantization"] if args.itq_and_costs else base_methods
+    source_reports, fit_report_hashes = {}, {}
+    if args.itq_and_costs:
+        for seed in config["seeds"]:
+            report_bytes = (args.unseen_database_from / f"seed-{seed}.json").read_bytes()
+            source_reports[seed] = json.loads(report_bytes)
+            fit_report_hashes[str(seed)] = hashlib.sha256(report_bytes).hexdigest()
     artifact_hashes = {}
     for seed in config["seeds"]:
         for bits in config["bits"]:
-            for method in methods:
+            for method in base_methods:
                 relative = Path("models") / f"seed-{seed}" / f"{method}-{bits}"
                 files = ["transform.npz"] if method == "pca" else ["transform.npz", "autoencoder.pt"]
                 for filename in files:
@@ -127,6 +185,13 @@ def evaluate_unseen_database(args, versions):
                 "versions": versions, "fixed_weights": source["fixed_weights"],
                 "source_protocol": str(source_path), "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
                 "source_config": config, "artifact_sha256": artifact_hashes}
+    if args.itq_and_costs:
+        manifest["config"].update({"methods": methods, "threshold_rule": "saved_median_except_itq_centered_zero",
+                                   "itq_iterations": 50, "itq_fit_rows": config["train_size"],
+                                   "itq_preprocessing": "training_latent_mean_only",
+                                   "cpu_timing_threads": 1, "cpu_timing_warmups": 2, "cpu_timing_repeats": 7,
+                                   "timing_scope": "RAM images to packed codes; no loading, fitting, or search"})
+        manifest["fit_report_sha256"] = fit_report_hashes
     save_report(args.output_dir / "protocol.json", manifest)
     start = time.perf_counter()
     for seed in config["seeds"]:
@@ -137,9 +202,23 @@ def evaluate_unseen_database(args, versions):
         for bits in config["bits"]:
             for method in methods:
                 directory = args.unseen_database_from / "models" / f"seed-{seed}" / f"{method}-{bits}"
-                metrics = evaluate_saved_databases(partitions, directory, args.device)
+                extra = {}
+                if method == "pca_itq":
+                    source_directory = args.unseen_database_from / "models" / f"seed-{seed}" / f"pca-{bits}"
+                    directory = args.output_dir / "models" / f"seed-{seed}" / f"pca_itq-{bits}"
+                    extra = fit_itq_artifact(data[0], source_directory, directory, seed)
+                metrics = evaluate_saved_databases(partitions, directory, args.device, itq=method == "pca_itq")
+                if args.itq_and_costs:
+                    source_method = "pca" if method == "pca_itq" else method
+                    original = next(r for r in source_reports[seed]["results"]
+                                    if r["method"] == source_method and r["bits"] == bits)
+                    costs = measure_cpu_encoding(directory, partitions["queries"]["images"], itq=method == "pca_itq")
+                    costs.update({"recorded_base_fit_seconds": original["fit_seconds"],
+                                  "inference_parameter_bytes": extra.get("inference_parameter_bytes",
+                                                                         original["inference_parameter_bytes"])})
+                    extra["costs"] = costs
                 results.append({"method": method, "bits": bits, "seed": seed, "artifact_dir": str(directory),
-                                "retrieval": metrics})
+                                "retrieval": metrics, **extra})
                 print(f"seed={seed} {method} {bits} bits: " + ", ".join(
                     f"{name}={values['test_precision_at_10']:.5f}" for name, values in metrics.items()), flush=True)
         partition_records = {name: {"official_split": values["official_split"], "ids": values["ids"].tolist(),
@@ -166,7 +245,10 @@ def main():
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
     parser.add_argument("--smoke", action="store_true", help="Reduced training and validation queries only")
     parser.add_argument("--unseen-database-from", type=Path, help="Evaluate existing frozen KMNIST models without training")
+    parser.add_argument("--itq-and-costs", action="store_true", help="Add training-only PCA ITQ and CPU cost measurements")
     args = parser.parse_args()
+    if args.itq_and_costs and args.unseen_database_from is None:
+        parser.error("--itq-and-costs requires --unseen-database-from")
     versions = {"numpy": np.__version__, "torch": torch.__version__,
                 "torchvision": torchvision.__version__, "sklearn": sklearn.__version__}
     if args.output_dir.exists():
