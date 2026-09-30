@@ -162,7 +162,8 @@ def evaluate(database_codes, query_codes, database_labels, query_labels, k):
     }
 
 
-def load_data(root, seed, train_size, validation_size, query_size, query_split="test", dataset="fashion_mnist"):
+def load_data(root, seed, train_size, validation_size, query_size, query_split="test", dataset="fashion_mnist",
+              return_ids=False):
     if dataset == "fashion_mnist":
         dataset_class = FashionMNIST
     elif dataset == "kmnist":
@@ -189,9 +190,12 @@ def load_data(root, seed, train_size, validation_size, query_size, query_split="
     def images(dataset, ids):
         return dataset.data[ids].numpy().reshape(len(ids), 784).astype(np.float32) / 255.0
 
-    return (images(official_train, train_ids), images(official_train, validation_ids),
+    data = (images(official_train, train_ids), images(official_train, validation_ids),
             images(query_dataset, query_ids), official_train.targets[train_ids].numpy(),
             query_dataset.targets[query_ids].numpy())
+    if return_ids:
+        return (*data, {"train": train_ids, "validation": validation_ids, "queries": query_ids})
+    return data
 
 
 def main():

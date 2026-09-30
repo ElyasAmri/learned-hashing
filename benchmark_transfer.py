@@ -65,6 +65,99 @@ def run_pca(data, bits, seed, split, artifact_dir):
             "artifact_dir": str(artifact_dir), "artifact_roundtrip": "passed", **metrics}
 
 
+def unseen_partitions(data):
+    train, _, test, train_labels, test_labels, ids = data
+    size = len(test) // 2
+    if len(test) % 2 or size < 10 or len(train) < size:
+        raise ValueError("Need equal test halves and a matched training database of at least 10 items")
+    if np.intersect1d(ids["queries"][:size], ids["queries"][size:]).size:
+        raise ValueError("Unseen database and query IDs overlap")
+    return {
+        "training_database": {"images": train[:size], "labels": train_labels[:size],
+                              "ids": ids["train"][:size], "official_split": "train"},
+        "unseen_database": {"images": test[:size], "labels": test_labels[:size],
+                            "ids": ids["queries"][:size], "official_split": "test"},
+        "queries": {"images": test[size:], "labels": test_labels[size:],
+                    "ids": ids["queries"][size:], "official_split": "test"},
+    }
+
+
+def evaluate_saved_databases(partitions, directory, device):
+    transform, saved = load_artifact(directory, device)
+    # Thresholds are reused from training, never fitted to either database or queries.
+    thresholds = saved["binary_thresholds"]
+    np.testing.assert_array_equal(thresholds, saved["median_thresholds"])
+    queries = partitions["queries"]
+    query_codes = quantize(transform(queries["images"]), thresholds)
+    results = {}
+    for name in ["training_database", "unseen_database"]:
+        database = partitions[name]
+        database_codes = quantize(transform(database["images"]), thresholds)
+        metrics = evaluate(database_codes, query_codes, database["labels"], queries["labels"], 10)
+        metrics["test_precision_at_10"] = metrics.pop("same_class_precision_at_10")
+        results[name] = metrics
+    return results
+
+
+def evaluate_unseen_database(args, versions):
+    source_path = args.unseen_database_from / "protocol.json"
+    source_bytes = source_path.read_bytes()
+    source = json.loads(source_bytes)
+    config = source["config"]
+    if (config["dataset"] != "kmnist" or config["smoke"] or config["query_split"] != "test"
+            or config["query_size"] != 10000 or config["train_size"] != 50000):
+        raise ValueError("Unseen evaluation requires a full frozen KMNIST benchmark")
+    if versions != source["versions"]:
+        raise ValueError("Library versions differ from saved models")
+    methods = ["pca", "autoencoder", "quantization"]
+    artifact_hashes = {}
+    for seed in config["seeds"]:
+        for bits in config["bits"]:
+            for method in methods:
+                relative = Path("models") / f"seed-{seed}" / f"{method}-{bits}"
+                files = ["transform.npz"] if method == "pca" else ["transform.npz", "autoencoder.pt"]
+                for filename in files:
+                    path = relative / filename
+                    artifact_hashes[str(path)] = hashlib.sha256((args.unseen_database_from / path).read_bytes()).hexdigest()
+    manifest = {"config": {"dataset": "kmnist", "seeds": config["seeds"], "bits": config["bits"],
+                           "database_size": 5000, "query_size": 5000, "device": args.device,
+                           "data_dir": str(args.data_dir), "threshold_rule": "saved_training_median",
+                           "test_partition": "first_half_database_second_half_queries",
+                           "training_database": "first_5000_training_rows", "retrained": False},
+                "versions": versions, "fixed_weights": source["fixed_weights"],
+                "source_protocol": str(source_path), "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+                "source_config": config, "artifact_sha256": artifact_hashes}
+    save_report(args.output_dir / "protocol.json", manifest)
+    start = time.perf_counter()
+    for seed in config["seeds"]:
+        data = load_data(args.data_dir, seed, config["train_size"], config["validation_size"],
+                         config["query_size"], dataset="kmnist", return_ids=True)
+        partitions = unseen_partitions(data)
+        results = []
+        for bits in config["bits"]:
+            for method in methods:
+                directory = args.unseen_database_from / "models" / f"seed-{seed}" / f"{method}-{bits}"
+                metrics = evaluate_saved_databases(partitions, directory, args.device)
+                results.append({"method": method, "bits": bits, "seed": seed, "artifact_dir": str(directory),
+                                "retrieval": metrics})
+                print(f"seed={seed} {method} {bits} bits: " + ", ".join(
+                    f"{name}={values['test_precision_at_10']:.5f}" for name, values in metrics.items()), flush=True)
+        partition_records = {name: {"official_split": values["official_split"], "ids": values["ids"].tolist(),
+                                    "class_counts": np.bincount(values["labels"], minlength=10).tolist()}
+                             for name, values in partitions.items()}
+        save_report(args.output_dir / f"seed-{seed}.json",
+                    {"config": {**manifest["config"], "seed": seed}, "partitions": partition_records,
+                     "results": results})
+    for relative, expected in artifact_hashes.items():
+        actual = hashlib.sha256((args.unseen_database_from / relative).read_bytes()).hexdigest()
+        if actual != expected:
+            raise RuntimeError(f"Source artifact changed during evaluation: {relative}")
+    save_report(args.output_dir / "completion.json",
+                {"source_artifacts_unchanged": True, "artifact_files_checked": len(artifact_hashes),
+                 "model_evaluations": len(config["seeds"]) * len(config["bits"]) * len(methods),
+                 "elapsed_seconds": time.perf_counter() - start})
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, default=Path("results/qat-median/tuning.json"))
@@ -72,17 +165,23 @@ def main():
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
     parser.add_argument("--smoke", action="store_true", help="Reduced training and validation queries only")
+    parser.add_argument("--unseen-database-from", type=Path, help="Evaluate existing frozen KMNIST models without training")
     args = parser.parse_args()
+    versions = {"numpy": np.__version__, "torch": torch.__version__,
+                "torchvision": torchvision.__version__, "sklearn": sklearn.__version__}
+    if args.output_dir.exists():
+        parser.error("Output directory exists; choose a fresh path")
+    if args.unseen_database_from is not None:
+        if args.smoke:
+            parser.error("Unseen-database evaluation cannot use smoke models or splits")
+        evaluate_unseen_database(args, versions)
+        return
     source_bytes = args.source.read_bytes()
     source = json.loads(source_bytes)
     config, weights = frozen_settings(source, args.smoke)
     config.update({"data_dir": str(args.data_dir), "device": args.device})
-    versions = {"numpy": np.__version__, "torch": torch.__version__,
-                "torchvision": torchvision.__version__, "sklearn": sklearn.__version__}
     if versions != source["versions"]:
         parser.error("Library versions differ from the frozen source report")
-    if args.output_dir.exists():
-        parser.error("Output directory exists; choose a fresh path")
     manifest = {"config": config, "fixed_weights": weights, "versions": versions,
                 "source_report": str(args.source), "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
                 "source_config": source["config"]}

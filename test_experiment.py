@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from sklearn.decomposition import PCA
 
-from benchmark_transfer import frozen_settings, run_pca
+from benchmark_transfer import evaluate_saved_databases, frozen_settings, run_pca, unseen_partitions
 from diagnose_quantization import continuous_neighbors, fit_itq, load_artifact, save_artifact
 from experiment import (Autoencoder, code_statistics, encode, evaluate, load_data,
                         hamming_neighbors, pair_distances, quantize, quantization_penalty, separation_penalty,
@@ -305,11 +305,14 @@ class TransferTests(unittest.TestCase):
             return FakeDataset(60000, 0) if train else FakeDataset(10000, 60000)
 
         with patch("experiment.FashionMNIST") as fashion, patch("experiment.KMNIST", side_effect=factory) as kmnist:
-            train, validation, queries, labels, query_labels = load_data("unused", 42, 5, 3, 2, dataset="kmnist")
+            train, validation, queries, labels, query_labels, ids = load_data(
+                "unused", 42, 5, 3, 2, dataset="kmnist", return_ids=True)
             self.assertEqual(kmnist.call_args_list, [call("unused", train=True, download=True),
                                                    call("unused", train=False, download=True)])
             fashion.assert_not_called()
         self.assertTrue((query_labels >= 60000).all())
+        np.testing.assert_array_equal(ids["train"], labels)
+        np.testing.assert_array_equal(ids["queries"] + 60000, query_labels)
         self.assertTrue((labels < 60000).all())
         self.assertEqual(queries.shape, (2, 784))
         with patch("experiment.KMNIST", side_effect=factory) as kmnist:
@@ -329,6 +332,54 @@ class TransferTests(unittest.TestCase):
             self.assertNotIn("validation_precision_at_10", result)
             transform, saved = load_artifact(Path(root) / "pca")
             np.testing.assert_array_equal(saved["binary_thresholds"], np.median(transform(train), axis=0))
+
+
+class UnseenDatabaseTests(unittest.TestCase):
+    def setUp(self):
+        rng = np.random.default_rng(42)
+        train = rng.normal(size=(24, 4)).astype(np.float32)
+        test = rng.normal(loc=10, size=(20, 4)).astype(np.float32)
+        self.data = (train, train[:4], test, np.arange(24) % 2, np.arange(20) % 2,
+                     {"train": np.arange(24), "validation": np.arange(50, 54), "queries": np.arange(100, 120)})
+
+    def test_unseen_database_and_queries_are_disjoint_and_matched(self):
+        partitions = unseen_partitions(self.data)
+        seen, unseen, queries = [partitions[name] for name in ["training_database", "unseen_database", "queries"]]
+        self.assertEqual(len(seen["images"]), 10)
+        self.assertEqual(len(unseen["images"]), 10)
+        self.assertEqual(len(queries["images"]), 10)
+        self.assertEqual(seen["official_split"], "train")
+        self.assertEqual(unseen["official_split"], "test")
+        self.assertEqual(queries["official_split"], "test")
+        self.assertFalse(set(unseen["ids"]) & set(queries["ids"]))
+        np.testing.assert_array_equal(unseen["images"], self.data[2][:10])
+        np.testing.assert_array_equal(queries["images"], self.data[2][10:])
+        np.testing.assert_array_equal(seen["images"], self.data[0][:10])
+        np.testing.assert_array_equal(queries["labels"], self.data[4][10:])
+
+    def test_reject_overlapping_query_ids(self):
+        self.data[5]["queries"][-1] = self.data[5]["queries"][0]
+        with self.assertRaisesRegex(ValueError, "IDs overlap"):
+            unseen_partitions(self.data)
+
+    def test_saved_thresholds_and_query_codes_are_reused(self):
+        partitions = unseen_partitions(self.data)
+        thresholds = np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float32)
+        arrays = {"binary_thresholds": thresholds.copy(), "median_thresholds": thresholds.copy()}
+        with patch("benchmark_transfer.load_artifact", return_value=(lambda x: x, arrays)) as loader:
+            with patch("benchmark_transfer.evaluate", wraps=evaluate) as evaluator:
+                results = evaluate_saved_databases(partitions, Path("unused"), "cpu")
+                self.assertEqual(evaluator.call_count, 2)
+                first, second = evaluator.call_args_list
+                self.assertIs(first.args[1], second.args[1])
+                np.testing.assert_array_equal(first.args[1], self.data[2][10:] > thresholds)
+                np.testing.assert_array_equal(first.args[0], self.data[0][:10] > thresholds)
+                np.testing.assert_array_equal(second.args[0], self.data[2][:10] > thresholds)
+            loader.assert_called_once_with(Path("unused"), "cpu")
+        np.testing.assert_array_equal(arrays["binary_thresholds"], thresholds)
+        self.assertEqual(results["unseen_database"]["unique_codes"], 1)
+        self.assertEqual(results["unseen_database"]["bit_one_fractions"], [1.0] * 4)
+        self.assertIn("test_precision_at_10", results["training_database"])
 
 
 if __name__ == "__main__":

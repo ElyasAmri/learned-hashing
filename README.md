@@ -204,10 +204,38 @@ The full run took 12 minutes 53 seconds. **KMNIST test precision@10 (%)**, mean 
 | 32 | 65.41 +/- 0.12 | 63.11 +/- 0.69 | 65.13 +/- 0.19 | -0.28 |
 | 64 | 71.81 +/- 0.09 | 72.24 +/- 0.33 | 73.44 +/- 0.34 | +1.63 |
 
-The quantization AE beat the plain AE in all five seeds at every bit length, with mean gains of 3.13, 2.02, and 1.19 points. Against PCA it won 5/5 seeds at 16 bits, 2/5 at 32 bits, and 5/5 at 64 bits. This supports transfer of the quantization benefit over the plain AE, but not uniform superiority to PCA or a state-of-the-art claim. Seed variation reuses the same test images and is not a confidence interval over independent datasets. The retrieval database still contains training items; unseen-database generalization and broader baseline tuning remain unchecked.
+The quantization AE beat the plain AE in all five seeds at every bit length, with mean gains of 3.13, 2.02, and 1.19 points. Against PCA it won 5/5 seeds at 16 bits, 2/5 at 32 bits, and 5/5 at 64 bits. This supports transfer of the quantization benefit over the plain AE, but not uniform superiority to PCA or a state-of-the-art claim. Seed variation reuses the same test images and is not a confidence interval over independent datasets. The retrieval database in this experiment contains training items; the follow-up below evaluates unseen database items. Broader baseline tuning remains unchecked.
 
 Reports, the pre-run protocol, and all 45 fitted model/transform artifacts are in `results/kmnist-frozen/`. Every artifact passed query-encoding and binary-code reload checks on all 10,000 test queries. `results/kmnist-smoke/` retains the failed download's protocol only; `results/kmnist-smoke-v2/` contains the successful smoke results. Do not merge these KMNIST test scores with the preceding Fashion-MNIST validation tables.
 
+## Unseen retrieval database: frozen models
+
+```powershell
+.venv/Scripts/python benchmark_transfer.py --unseen-database-from results/kmnist-frozen --output-dir results/kmnist-unseen-next
+```
+
+This mode only loads saved models; it does not train, fit PCA, select checkpoints, or recalibrate thresholds. For each seed, the original seeded KMNIST test permutation is split into its first 5,000 images as the unseen database and last 5,000 as queries. The query and unseen-database IDs are disjoint. A matched control uses the first 5,000 images from that model's training permutation as the database, against the exact same query codes. All thresholds remain medians from the original 50,000 training images.
+
+The protocol is written before evaluation, including source-protocol and artifact SHA-256 hashes. Seed reports save the official split, row IDs, and class counts of all three partitions. `completion.json` records that all 75 source files (45 transforms and 30 AE state dicts) remained unchanged. The run evaluated 45 saved models against both databases in 65 seconds, without creating new model artifacts. Reports are in `results/kmnist-unseen/`.
+
+Precision@10 (%) below is mean +/- sample standard deviation over five seeds. Each database has 5,000 images, and each run has 5,000 queries:
+
+| Bits | Model | Training database control | Unseen database |
+|---|---|---:|---:|
+| 16 | PCA | 46.11 +/- 0.61 | 48.72 +/- 0.34 |
+| 16 | Plain AE | 46.70 +/- 0.94 | 50.00 +/- 1.17 |
+| 16 | Quantization AE | 49.35 +/- 1.08 | 52.99 +/- 0.38 |
+| 32 | PCA | 51.60 +/- 0.53 | 57.62 +/- 0.18 |
+| 32 | Plain AE | 51.28 +/- 0.85 | 56.78 +/- 0.91 |
+| 32 | Quantization AE | 52.53 +/- 0.52 | 58.14 +/- 0.39 |
+| 64 | PCA | 52.51 +/- 0.45 | 60.52 +/- 0.22 |
+| 64 | Plain AE | 56.98 +/- 0.73 | 64.93 +/- 0.46 |
+| 64 | Quantization AE | 57.64 +/- 0.91 | 65.03 +/- 0.45 |
+
+On the unseen database, quantization AE beat PCA in all five seeds at every bit length; mean gains were 4.27, 0.52, and 4.51 points. Gains over the plain AE were 2.99, 1.36, and 0.10 points, with wins in 5/5, 5/5, and 3/5 seeds. The 64-bit quantization benefit is therefore small and inconsistent, despite the advantage over PCA.
+
+All methods scored higher on the unseen database than on the matched training control. Both unseen database and queries come from the official test split, whereas the control database comes from the official training split. Equal sizes and shared queries control database size and query identity, not differences in split distributions, class composition, or sampling; the gap cannot be attributed solely to training exposure. These are follow-up diagnostics on a previously inspected test pool, not a new untouched benchmark. Query pools overlap across seeds, and these deviations are not confidence intervals over independent datasets. Do not compare these absolute scores directly with the previous 50,000-database/10,000-query results.
+
 ## Next decision
 
-Keep the recipe frozen. Next, evaluate an unseen retrieval database to separate generalization from fitting the database items. Use a predeclared protocol or fresh data rather than tuning against the now-inspected KMNIST test results. Compare with stronger established hashing baselines before making broader performance claims.
+Keep the recipe frozen and compare against stronger established hashing baselines under this same unseen-database protocol. The quantization AE's advantage over PCA persists without training on database images, but its extra benefit over the plain AE is not consistent at 64 bits. Do not tune against these now-inspected results or claim state-of-the-art performance from these two small datasets.
