@@ -1,5 +1,7 @@
 # Learned hashing pilot
 
+[Complete experiment summary](EXPERIMENT_SUMMARY.md): every configuration, tuning candidate, result, and cost comparison. Original completed JSON reports are included under [results/](results/).
+
 Test whether an autoencoder's binary latent codes preserve category similarity better than projection baselines at the same bit budget. Fashion-MNIST and KMNIST support development experiments, with frozen-configuration evaluations on KMNIST and MNIST. This is similarity search, not an exact-key hash-table benchmark.
 
 ## Run (PowerShell)
@@ -16,7 +18,7 @@ python -m venv .venv
 .venv/Scripts/python experiment.py --output results/pilot.json
 ```
 
-The first experiment run downloads Fashion-MNIST into `data/`. Reports go to ignored `results/`; use a fresh output filename for each run. CPU is the default. On this RTX 5080 machine, install the tested CUDA 12.8 wheels into the existing environment, then run:
+The first experiment run downloads Fashion-MNIST into `data/`. Completed JSON reports are published under `results/`; datasets, checkpoints, smoke reports, and interrupted runs stay ignored. Use fresh output filenames/directories for reruns. Commands that reuse saved model artifacts require regenerating those models first; published JSON reports alone do not provide model weights. CPU is the default for the original pilot. On this RTX 5080 machine, install the tested CUDA 12.8 wheels into the existing environment, then run:
 
 ```powershell
 .venv/Scripts/python -m pip install torch==2.11.0+cu128 torchvision==0.26.0+cu128 --index-url https://download.pytorch.org/whl/cu128

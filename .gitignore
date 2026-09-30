@@ -1,4 +1,17 @@
 .venv/
 data/
-results/
 __pycache__/
+
+# Publish only completed JSON reports, never datasets or model checkpoints.
+results/*
+!results/pilot-gpu*.json
+!results/penalties/
+!results/quantization-v2/
+!results/qat/
+!results/qat-median/
+!results/kmnist-frozen/
+!results/kmnist-unseen/
+!results/kmnist-itq-costs/
+!results/contrastive/
+results/*/*
+!results/*/*.json

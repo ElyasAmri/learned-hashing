@@ -1,0 +1,56 @@
+{
+  "config": {
+    "bits": [
+      16,
+      32,
+      64
+    ],
+    "seeds": [
+      42,
+      7,
+      21,
+      84,
+      123
+    ],
+    "epochs": 20,
+    "batch_size": 256,
+    "train_size": 50000,
+    "validation_size": 10000,
+    "tuning_queries": 2000,
+    "query_pool_size": 10000,
+    "temperatures": [
+      0.1,
+      0.2,
+      0.5
+    ],
+    "quantization_weight": 0.001,
+    "tuning_dataset": "kmnist",
+    "evaluation_dataset": "mnist",
+    "evaluation_query_split": "test",
+    "threshold_rule": "training_median",
+    "tuning_seed": 42,
+    "smoke": false,
+    "data_dir": "data",
+    "device": "cuda",
+    "augmentation": {
+      "rotation_degrees": 10,
+      "scale": [
+        0.9,
+        1.1
+      ],
+      "grid_translation_pixels": 2,
+      "interpolation": "bilinear",
+      "padding": "zeros",
+      "flips": false
+    },
+    "checkpoint_selection": "minimum_fixed_view_validation_base_objective",
+    "projection_head": false,
+    "itq_iterations": 50
+  },
+  "versions": {
+    "numpy": "2.2.6",
+    "torch": "2.11.0+cu128",
+    "torchvision": "0.26.0+cu128",
+    "sklearn": "1.7.2"
+  }
+}

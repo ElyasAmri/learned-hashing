@@ -1,0 +1,82 @@
+{
+  "config": {
+    "epochs": 20,
+    "batch_size": 256,
+    "train_size": 50000,
+    "validation_size": 10000,
+    "query_size": 10000,
+    "bits": [
+      16,
+      32,
+      64
+    ],
+    "seeds": [
+      42,
+      7,
+      21,
+      84,
+      123
+    ],
+    "dataset": "kmnist",
+    "query_split": "test",
+    "quantization_threshold": "median",
+    "checkpoint_selection": "minimum_validation_reconstruction_mse",
+    "smoke": false,
+    "data_dir": "data",
+    "device": "cuda"
+  },
+  "fixed_weights": {
+    "16": 0.001,
+    "32": 0.0003,
+    "64": 0.0003
+  },
+  "versions": {
+    "numpy": "2.2.6",
+    "torch": "2.11.0+cu128",
+    "torchvision": "0.26.0+cu128",
+    "sklearn": "1.7.2"
+  },
+  "source_report": "results\\qat-median\\tuning.json",
+  "source_sha256": "7af021dde1009d27c02df56541f5b2cd84fbbab17124c2d2cbb0b66df5fd7abe",
+  "source_config": {
+    "stage": "all",
+    "output_dir": "results\\qat-median",
+    "data_dir": "data",
+    "device": "cuda",
+    "bits": [
+      16,
+      32,
+      64
+    ],
+    "seeds": [
+      42,
+      7,
+      21,
+      84,
+      123
+    ],
+    "weights": [
+      1e-05,
+      3e-05,
+      0.0001,
+      0.0003,
+      0.001
+    ],
+    "penalties": [
+      "quantization"
+    ],
+    "quantization_threshold": "median",
+    "query_split": "validation",
+    "save_models": true,
+    "epochs": 20,
+    "batch_size": 256,
+    "train_size": 50000,
+    "validation_size": 10000,
+    "tuning_queries": 2000,
+    "query_size": 10000,
+    "temperature": 1.0,
+    "epsilon": 0.001,
+    "tuning_seed": 42,
+    "checkpoint_selection": "minimum_validation_reconstruction_mse"
+  }
+}
