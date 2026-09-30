@@ -11,7 +11,7 @@ import torch
 from sklearn.decomposition import PCA
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
-from torchvision.datasets import FashionMNIST, KMNIST
+from torchvision.datasets import FashionMNIST, KMNIST, MNIST
 
 
 POPCOUNT = np.array([i.bit_count() for i in range(256)], dtype=np.uint8)
@@ -168,6 +168,8 @@ def load_data(root, seed, train_size, validation_size, query_size, query_split="
         dataset_class = FashionMNIST
     elif dataset == "kmnist":
         dataset_class = KMNIST
+    elif dataset == "mnist":
+        dataset_class = MNIST
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
     official_train = dataset_class(root, train=True, download=True)

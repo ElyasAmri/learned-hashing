@@ -1,6 +1,6 @@
 # Learned hashing pilot
 
-Test whether an autoencoder's binary latent codes preserve category similarity better than projection baselines at the same bit budget. Fashion-MNIST is the development dataset; KMNIST tests the frozen configuration on a new benchmark. This is similarity search, not an exact-key hash-table benchmark.
+Test whether an autoencoder's binary latent codes preserve category similarity better than projection baselines at the same bit budget. Fashion-MNIST and KMNIST support development experiments, with frozen-configuration evaluations on KMNIST and MNIST. This is similarity search, not an exact-key hash-table benchmark.
 
 ## Run (PowerShell)
 
@@ -284,6 +284,49 @@ PCA/AE fitting times below are reused from `results/kmnist-frozen/`, not rerun h
 
 Reports and the 15 new ITQ transforms are in `results/kmnist-itq-costs/`. After `load_artifact`, ITQ inference uses `saved_codes(transform, arrays, images, itq=True)` to apply the saved centering and rotation. The protocol records timing settings and source-report hashes; completion checks all 75 original model/transform files remained unchanged. ITQ artifacts passed reload comparisons against their training codes, and all 15 quantization objectives were nonincreasing within numerical tolerance. This remains a follow-up on the previously inspected KMNIST test pool, not another untouched benchmark. ITQ underperformed on the earlier Fashion-MNIST diagnostic, so this result should not be generalized to every dataset.
 
+## Contrastive objective with fresh MNIST evaluation
+
+```powershell
+# Smoke stays on KMNIST validation; it never loads MNIST.
+.venv/Scripts/python contrastive_experiment.py --smoke --output-dir results/contrastive-smoke-next
+.venv/Scripts/python contrastive_experiment.py --stage tune --output-dir results/contrastive-next
+.venv/Scripts/python contrastive_experiment.py --stage evaluate --output-dir results/contrastive-next
+```
+
+The same `784 -> 128 -> bits` encoder is trained directly with symmetric NT-Xent contrastive loss, with no extra projection head or reconstruction loss. Two independent views of each image are positives; other minibatch images are negatives, including possible same-class images. The loss uses L2-normalized embeddings, but inference hashes raw encoder outputs at training medians. The weak quantization term is `0.001 * mean((abs(z) - 1)^2)`.
+
+Views use bilinear affine sampling with rotations within 10 degrees, scale factors 0.9 to 1.1, sampling-grid translations within two pixels per axis, and zero padding. No flips are used. Adam remains at learning rate 0.001, with 20 epochs and 256 source images per batch (512 augmented views). The contrastive decoder is neither trained nor used; its initialized state is retained only for compatibility with the existing artifact format and excluded from inference parameter counts.
+
+The matched **augmented reconstruction** control uses the same encoder architecture, initialization, image ordering, two-view augmentations, and quantization weight. It reconstructs the augmented inputs through the existing decoder. Each neural model selects its checkpoint by its own base objective on fixed seeded validation views, excluding the quantization term. This controls augmentation and encoder capacity, though the losses, decoder training, and checkpoint criteria necessarily differ.
+
+Temperature candidates 0.1, 0.2, and 0.5 are selected separately per bit length using median-code precision@10 on 2,000 KMNIST validation queries against the 50,000 training images at seed 42; ties favor lower temperatures. No labels enter gradient training, but validation labels select temperature. The selected temperatures were **0.5, 0.5, and 0.2** at 16/32/64 bits. These were frozen before any MNIST evaluation. No model weights transfer between datasets: all evaluated models are fitted from scratch on MNIST. The PCA + ITQ baseline remains the fixed 50-iteration unwhitened procedure, and no MNIST retrieval scores change any settings.
+
+MNIST was reserved as the new benchmark because the KMNIST test pool had already been inspected. For each of the same five seeds, models fit 50,000 official training images, use the remaining 10,000 for unsupervised checkpoint selection, then hash 5,000 official test images as an unseen database and the other 5,000 as disjoint queries. The same 5,000-item training-database control is also recorded. Test labels are used only for evaluation. The smoke run uses a reduced KMNIST validation split instead.
+
+Tuning took 2 minutes 19 seconds (nine candidates); frozen evaluation took 7 minutes 55 seconds (60 model/transform artifacts and 120 retrieval evaluations). **MNIST unseen-database precision@10 (%)**, mean +/- sample standard deviation across five seeds:
+
+| Bits | PCA | PCA + ITQ | Matched augmented reconstruction | Contrastive |
+|---|---:|---:|---:|---:|
+| 16 | 65.31 +/- 0.17 | 74.73 +/- 0.85 | 69.79 +/- 0.91 | 76.24 +/- 1.28 |
+| 32 | 72.22 +/- 0.27 | 82.39 +/- 0.52 | 75.07 +/- 0.75 | 81.12 +/- 0.79 |
+| 64 | 72.74 +/- 0.25 | 85.70 +/- 0.46 | 81.11 +/- 0.42 | 83.83 +/- 0.76 |
+
+Contrastive gains over the matched control were 6.45, 6.05, and 2.72 points, with wins in all five seeds at each bit length. Against PCA + ITQ, gains were +1.51, -1.27, and -1.86 points, with wins in 4/5, 0/5, and 0/5 seeds. The matched training-database control gave the same mean ranking: contrastive scored 75.51, 80.67, and 82.94%, versus PCA + ITQ's 74.20, 81.72, and 85.08%. Do not compare these absolute scores with KMNIST or compare the augmented reconstruction control with an unaugmented AE as though they were the same experiment.
+
+### Cost of the new objective
+
+CPU encoding follows the same single-thread, two-warm-up/seven-repeat protocol above. Times are means of per-seed median elapsed times for encoding and packing all 5,000 queries. Inference size remains 400.63/408.75/425.00 KiB for either neural encoder versus 54.31/109.56/232.06 KiB for PCA + ITQ.
+
+| Bits | PCA + ITQ encode ms | Matched reconstruction encode ms | Contrastive encode ms | PCA + ITQ fit s | Matched reconstruction fit s | Contrastive fit s |
+|---|---:|---:|---:|---:|---:|---:|
+| 16 | 1.01 | 7.80 | 7.79 | 0.56 | 12.00 | 13.08 |
+| 32 | 1.94 | 8.02 | 7.97 | 0.90 | 11.45 | 12.94 |
+| 64 | 4.06 | 8.37 | 8.57 | 1.84 | 11.58 | 12.80 |
+
+Unlike the previous cost table, fitting times here are from the new MNIST run. Neural fits include training, validation, training encoding, and median calibration on CUDA. PCA + ITQ sums CPU PCA fit/calibration and the subsequent training projection/rotation fit. They exclude saving and search and are implementation wall times, not a hardware-neutral algorithmic comparison. Temperature-search cost is separate.
+
+Reports and all nine tuning checkpoints plus 60 evaluation artifacts are in `results/contrastive/`. `protocol.json` reserves the complete setup before tuning; `tuning.json` records every candidate and fixed temperatures. Each evaluation report includes its tuning-report SHA-256, official split IDs, and class counts. Saved neural models passed validation-encoding/code reload checks, and PCA/ITQ transforms passed training-code reload checks. The full experiment did not change its settings after MNIST results. This is evidence for this shallow contrastive recipe, not a conclusion about all contrastive methods; repeated seeds share the official test pool and are not independent datasets or confidence intervals.
+
 ## Next decision
 
-Use PCA + ITQ as the stronger baseline to beat on this KMNIST protocol: it currently offers better retrieval, lower CPU encoding cost, and smaller inference parameters than either AE. Further reconstruction-based AE complexity is not justified by these results. A learned-hashing research direction should target a similarity-aware objective and be assessed on fresh data against this baseline, rather than continue tuning this test pool.
+Contrastive training is a more promising learned objective than matched reconstruction here, especially at 16 bits, but PCA + ITQ still wins at 32/64 bits and is cheaper to encode. Keep both as baselines. Before increasing architecture complexity, diagnose the contrastive representation's continuous-to-binary loss on development data or test a training-only rotation. Do not tune against the now-inspected MNIST test results.

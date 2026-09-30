@@ -10,6 +10,7 @@ from sklearn.decomposition import PCA
 
 from benchmark_transfer import (evaluate_saved_databases, fit_itq_artifact, frozen_settings,
                                 measure_cpu_encoding, run_pca, saved_codes, unseen_partitions)
+from contrastive_experiment import augment_views, contrastive_loss, select_temperatures, train_paired
 from diagnose_quantization import continuous_neighbors, fit_itq, load_artifact, save_artifact
 from experiment import (Autoencoder, code_statistics, encode, evaluate, load_data,
                         hamming_neighbors, pair_distances, quantize, quantization_penalty, separation_penalty,
@@ -426,6 +427,78 @@ class UnseenDatabaseTests(unittest.TestCase):
         self.assertEqual(results["unseen_database"]["unique_codes"], 1)
         self.assertEqual(results["unseen_database"]["bit_one_fractions"], [1.0] * 4)
         self.assertIn("test_precision_at_10", results["training_database"])
+
+
+class ContrastiveTests(unittest.TestCase):
+    def test_augmentations_are_seeded_bounded_and_nonmutating(self):
+        images = torch.linspace(0, 1, 4 * 784).reshape(4, 784)
+        original = images.clone()
+        first = augment_views(images, torch.Generator().manual_seed(42))
+        repeated = augment_views(images, torch.Generator().manual_seed(42))
+        second = augment_views(images, torch.Generator().manual_seed(43))
+        torch.testing.assert_close(first, repeated, rtol=0, atol=0)
+        torch.testing.assert_close(images, original, rtol=0, atol=0)
+        self.assertEqual(first.shape, images.shape)
+        self.assertTrue((first >= 0).all() and (first <= 1).all())
+        self.assertFalse(torch.equal(first, second))
+
+    def test_contrastive_loss_matches_uniform_case_and_pairing(self):
+        identical = torch.ones(3, 4)
+        self.assertAlmostEqual(contrastive_loss(identical, identical, 0.2).item(), np.log(5), places=6)
+        orthogonal = torch.eye(4)
+        matched = contrastive_loss(orthogonal, orthogonal, 0.1)
+        mismatched = contrastive_loss(orthogonal, orthogonal.roll(1, 0), 0.1)
+        self.assertLess(matched.item(), mismatched.item())
+        with self.assertRaises(ValueError):
+            contrastive_loss(orthogonal[:1], orthogonal[:1], 0.1)
+
+    def test_contrastive_gradients_are_finite(self):
+        first = torch.randn(4, 8, requires_grad=True)
+        second = torch.randn(4, 8, requires_grad=True)
+        loss = contrastive_loss(first, second, 0.2)
+        loss.backward()
+        self.assertTrue(torch.isfinite(first.grad).all())
+        self.assertTrue(torch.isfinite(second.grad).all())
+        self.assertGreater(first.grad.abs().sum().item(), 0)
+
+    def test_temperature_selection_uses_validation_and_lower_tie(self):
+        rows = [{"bits": 16, "temperature": temperature, "validation_precision_at_10": score,
+                 "test_precision_at_10": 1 - score}
+                for temperature, score in [(0.1, 0.5), (0.2, 0.6), (0.5, 0.6)]]
+        self.assertEqual(select_temperatures(rows, [16]), {"16": 0.2})
+
+    def test_paired_training_and_frozen_contrastive_decoder(self):
+        rng = np.random.default_rng(42)
+        train = rng.random((16, 784), dtype=np.float32)
+        validation = rng.random((8, 784), dtype=np.float32)
+        torch.manual_seed(42)
+        initial = Autoencoder(4)
+        for objective in ["contrastive", "augmented_reconstruction"]:
+            model, history = train_paired(train, validation, 4, 42, objective, 0.2, 2, 8, "cpu")
+            self.assertEqual(len(history), 2)
+            self.assertTrue(np.isfinite(history).all())
+            self.assertTrue(np.isfinite(encode(model, validation, "cpu")).all())
+            self.assertTrue(any(not torch.equal(p, q) for p, q in zip(model.encoder.parameters(), initial.encoder.parameters())))
+            if objective == "contrastive":
+                for p, q in zip(model.decoder.parameters(), initial.decoder.parameters()):
+                    torch.testing.assert_close(p, q, rtol=0, atol=0)
+                    self.assertFalse(p.requires_grad)
+
+    def test_mnist_loader_uses_requested_official_dataset(self):
+        class FakeDataset:
+            data = torch.arange(60000).reshape(-1, 1).expand(-1, 784)
+            targets = torch.arange(60000)
+
+            def __len__(self):
+                return 60000
+
+        with patch("experiment.MNIST", return_value=FakeDataset()) as mnist:
+            with patch("experiment.KMNIST") as kmnist, patch("experiment.FashionMNIST") as fashion:
+                data = load_data("unused", 42, 16, 8, 4, query_split="validation", dataset="mnist")
+                mnist.assert_called_once_with("unused", train=True, download=True)
+                kmnist.assert_not_called()
+                fashion.assert_not_called()
+                np.testing.assert_array_equal(data[2], data[1][:4])
 
 
 if __name__ == "__main__":
