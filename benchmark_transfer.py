@@ -90,8 +90,8 @@ def saved_codes(transform, saved, images, itq=False):
     return quantize(latent, saved["binary_thresholds"])
 
 
-def fit_itq_artifact(train, source_directory, directory, seed):
-    transform, saved = load_artifact(source_directory, "cpu")
+def fit_itq_artifact(train, source_directory, directory, seed, device="cpu"):
+    transform, saved = load_artifact(source_directory, device)
     start = time.perf_counter()
     latent = transform(train)
     projection_seconds = time.perf_counter() - start
@@ -101,15 +101,24 @@ def fit_itq_artifact(train, source_directory, directory, seed):
     arrays = {**saved, "latent_mean": mean, "rotation": rotation,
               "binary_thresholds": np.zeros(latent.shape[1]), "hash_rule": "itq_centered_zero"}
     directory.mkdir(parents=True, exist_ok=False)
+    if saved["method"].item() == "pca":
+        base_bytes = saved["components"].nbytes + saved["input_mean"].nbytes
+    else:
+        model_bytes = (source_directory / "autoencoder.pt").read_bytes()
+        with (directory / "autoencoder.pt").open("xb") as output:
+            output.write(model_bytes)
+        state = torch.load(directory / "autoencoder.pt", map_location="cpu", weights_only=True)
+        base_bytes = sum(value.numel() * value.element_size() for name, value in state.items()
+                         if name.startswith("encoder."))
     with (directory / "transform.npz").open("xb") as output:
         np.savez(output, **arrays)
-    restored, restored_arrays = load_artifact(directory, "cpu")
+    restored, restored_arrays = load_artifact(directory, device)
     np.testing.assert_array_equal(saved_codes(restored, restored_arrays, train, itq=True),
                                   (latent - mean) @ rotation > 0)
     return {"itq_projection_seconds": projection_seconds, "itq_fit_seconds": fit_seconds,
             "itq_quantization_mse_by_iteration": history, "artifact_roundtrip": "passed",
-            "inference_parameter_bytes": sum(arrays[key].nbytes for key in
-                ["components", "input_mean", "latent_mean", "rotation", "binary_thresholds"])}
+            "inference_parameter_bytes": base_bytes + sum(arrays[key].nbytes for key in
+                ["latent_mean", "rotation", "binary_thresholds"])}
 
 
 def measure_cpu_encoding(directory, images, itq=False):

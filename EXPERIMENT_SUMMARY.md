@@ -9,7 +9,7 @@ This file covers all completed full experiments and every tuning setting. Smoke 
 ## Reading the results
 
 - Metric: same-class precision@10 (%), higher is better. This is a category-similarity proxy, not exact-key hashing or nearest-neighbor recall.
-- Main tables show means across seeds 42, 7, 21, 84, and 123.
+- Main tables show means across seeds 42, 7, 21, 84, and 123 unless marked as single-seed diagnostics.
 - Tuning tables show single-seed validation results, not five-seed evaluations.
 - Do not compare absolute scores across datasets, database sizes, or validation/test protocols.
 - Repeated seeds share datasets; their variation is not a confidence interval over independent benchmarks.
@@ -184,6 +184,24 @@ Temperatures 0.1, 0.2, and 0.5 were selected on KMNIST validation. Frozen temper
 
 Source: [results/contrastive/](results/contrastive/).
 
+## 6b. Contrastive + ITQ validation follow-up
+
+**Single seed 42, KMNIST validation only: 50,000 training/database images and 2,000 validation queries.** This is not a five-seed or fresh-test result. The previously selected encoders and temperatures stayed fixed; ITQ fitted 50 iterations on their training embeddings only. Source encoder files remained unchanged. No MNIST or official test queries were loaded.
+
+| Representation | 16 dimensions/bits | 32 dimensions/bits | 64 dimensions/bits |
+|---|---:|---:|---:|
+| Contrastive continuous Euclidean | 82.445 | 83.240 | 86.890 |
+| Contrastive continuous cosine | 83.075 | 83.735 | 87.855 |
+| Contrastive centered continuous cosine | 83.200 | 83.815 | 87.710 |
+| Contrastive median binary | 67.915 | 76.575 | 82.355 |
+| Contrastive centered sign | 69.490 | 76.355 | 82.475 |
+| Contrastive + ITQ binary | 73.490 | 78.290 | 84.310 |
+| PCA + ITQ on the identical queries | 72.295 | 82.435 | 88.710 |
+
+ITQ gained 5.575, 1.715, and 1.955 points over contrastive median codes, and also beat the centered-sign control at every width. The rotated contrastive codes beat PCA + ITQ at 16 bits but trailed it at 32/64 bits. The encoder was not retrained; the new rotation increases inference parameters to 402.81/417.13/457.75 KiB. Speed was not remeasured. The same validation queries previously selected temperatures, so this promising 36-second diagnostic needs replication rather than a generalization claim.
+
+Source: [results/contrastive-itq-validation/](results/contrastive-itq-validation/).
+
 ## 7. Every tuning configuration
 
 All tables in this section use seed 42, 2,000 validation queries, and a 50,000-image training database. These are selection scores, not the five-seed evaluation results above. Bold scores identify the selected configuration per bit length and penalty family.
@@ -274,7 +292,8 @@ PCA/ITQ fit on CPU; neural training used CUDA. Fits include validation where app
 5. Beating plain PCA did not mean beating PCA + ITQ.
 6. ITQ was dataset-dependent: it hurt PCA on Fashion-MNIST but helped strongly on KMNIST and MNIST.
 7. Contrastive training is the most promising learned configuration tried here, especially at 16 bits.
-8. PCA + ITQ remained the better accuracy/cost choice at 32/64 bits in the latest evaluation.
+8. PCA + ITQ remained the better accuracy/cost choice at 32/64 bits in the latest five-seed evaluation.
+9. Adding ITQ to frozen contrastive encoders improved all three widths in a single-seed validation diagnostic, but did not close the higher-bit gap to PCA + ITQ.
 
 Development queries were reused extensively and baseline tuning budgets were not identical. MNIST was held for the frozen contrastive comparison, but is now inspected too. No state-of-the-art or universal superiority claim is supported, and these test pools should not be used for more tuning.
 
@@ -283,5 +302,5 @@ Development queries were reused extensively and baseline tuning budgets were not
 - The first Fashion-MNIST ITQ run stopped on one PCA bit changing after reload because memory layout affected rounding near a threshold. Canonical contiguous components fixed it; the full rerun supplied the reported results.
 - The first KMNIST download failed TLS validation. Official archives were downloaded through certificate-checked Windows HTTPS and matched to torchvision's digests; certificate checks were not disabled.
 - Smoke tests checked execution paths, not model quality. Smoke and interrupted-run reports are excluded from the published result bundle.
-- The latest experiment development test run had 37 passing unit tests, plus compilation and dependency checks.
+- The latest experiment development test run had 40 passing unit tests, plus compilation and dependency checks.
 - Public JSON reports retain configurations, per-seed metrics, tuning candidates, split IDs where recorded, validation histories, timing samples, and provenance hashes. Artifact paths refer to local checkpoints that must be regenerated; their presence in JSON does not mean checkpoints are published.

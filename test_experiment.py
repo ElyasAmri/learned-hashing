@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,12 +6,15 @@ from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import numpy as np
+import sklearn
 import torch
+import torchvision
 from sklearn.decomposition import PCA
 
 from benchmark_transfer import (evaluate_saved_databases, fit_itq_artifact, frozen_settings,
                                 measure_cpu_encoding, run_pca, saved_codes, unseen_partitions)
-from contrastive_experiment import augment_views, contrastive_loss, select_temperatures, train_paired
+from contrastive_experiment import (augment_views, contrastive_loss, diagnose_selected, latent_diagnostics,
+                                    select_temperatures, train_paired)
 from diagnose_quantization import continuous_neighbors, fit_itq, load_artifact, save_artifact
 from experiment import (Autoencoder, code_statistics, encode, evaluate, load_data,
                         hamming_neighbors, pair_distances, quantize, quantization_penalty, separation_penalty,
@@ -483,6 +487,82 @@ class ContrastiveTests(unittest.TestCase):
                 for p, q in zip(model.decoder.parameters(), initial.decoder.parameters()):
                     torch.testing.assert_close(p, q, rtol=0, atol=0)
                     self.assertFalse(p.requires_grad)
+
+    def test_neural_itq_keeps_encoder_bytes_and_counts_parameters(self):
+        rng = np.random.default_rng(42)
+        train = rng.random((24, 784), dtype=np.float32)
+        model = Autoencoder(4)
+        latent = encode(model, train, "cpu")
+        thresholds = np.median(latent, axis=0)
+        with tempfile.TemporaryDirectory() as root:
+            source, destination = Path(root) / "source", Path(root) / "rotated"
+            save_artifact(source, "autoencoder", model, latent.mean(axis=0), thresholds, np.eye(4), thresholds)
+            original = (source / "autoencoder.pt").read_bytes()
+            result = fit_itq_artifact(train, source, destination, 42)
+            self.assertEqual((source / "autoencoder.pt").read_bytes(), original)
+            self.assertEqual((destination / "autoencoder.pt").read_bytes(), original)
+            transform, arrays = load_artifact(destination)
+            np.testing.assert_array_equal(saved_codes(transform, arrays, train, itq=True),
+                                          (latent - arrays["latent_mean"]) @ arrays["rotation"] > 0)
+            encoder_bytes = sum(p.numel() * p.element_size() for p in model.encoder.parameters())
+            expected_bytes = encoder_bytes + sum(arrays[key].nbytes for key in
+                                                 ["latent_mean", "rotation", "binary_thresholds"])
+            self.assertEqual(result["inference_parameter_bytes"], expected_bytes)
+
+    def test_latent_diagnostics_keep_threshold_controls_separate(self):
+        rng = np.random.default_rng(42)
+        database = rng.normal(size=(30, 4)) + 3
+        queries = rng.normal(size=(8, 4)) + 3
+        labels, query_labels = np.arange(30) % 3, np.arange(8) % 3
+        mean, rotation, _ = fit_itq(database, 5, 42)
+        thresholds = np.median(database, axis=0)
+        result = latent_diagnostics(database, queries, labels, query_labels, thresholds, mean, rotation)
+        self.assertEqual(len(result), 6)
+        for name, db, q in [("median_binary", database > thresholds, queries > thresholds),
+                            ("centered_sign", database > mean, queries > mean),
+                            ("itq_binary", (database - mean) @ rotation > 0, (queries - mean) @ rotation > 0)]:
+            expected = evaluate(db, q, labels, query_labels, 10)["same_class_precision_at_10"]
+            self.assertEqual(result[name]["validation_precision_at_10"], expected)
+        for metrics in result.values():
+            self.assertGreaterEqual(metrics["validation_precision_at_10"], 0)
+            self.assertLessEqual(metrics["validation_precision_at_10"], 1)
+            self.assertNotIn("test_precision_at_10", metrics)
+
+    def test_diagnostic_never_loads_test_queries_or_retrains_encoder(self):
+        rng = np.random.default_rng(42)
+        train = rng.random((16, 784), dtype=np.float32)
+        validation = rng.random((8, 784), dtype=np.float32)
+        queries = validation[:4]
+        labels, query_labels = np.arange(16) % 2, np.arange(4) % 2
+        model = Autoencoder(4)
+        latent = encode(model, train, "cpu")
+        thresholds = np.median(latent, axis=0)
+        score = evaluate(latent > thresholds, encode(model, queries, "cpu") > thresholds,
+                         labels, query_labels, 10)["same_class_precision_at_10"]
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "source"
+            directory = source / "model"
+            save_artifact(directory, "autoencoder", model, latent.mean(axis=0), thresholds, np.eye(4), thresholds)
+            report = {"config": {"tuning_dataset": "kmnist", "threshold_rule": "training_median",
+                                  "tuning_seed": 42, "bits": [4], "train_size": 16, "validation_size": 8,
+                                  "tuning_queries": 4, "smoke": True},
+                      "versions": {"numpy": np.__version__, "torch": torch.__version__,
+                                   "torchvision": torchvision.__version__, "sklearn": sklearn.__version__},
+                      "selected_temperatures": {"4": 0.2},
+                      "results": [{"bits": 4, "temperature": 0.2, "artifact_dir": str(directory),
+                                   "validation_precision_at_10": score}]}
+            (source / "tuning.json").write_text(json.dumps(report))
+            args = SimpleNamespace(diagnose_from=source, reference_itq_from=None, device="cpu",
+                                   data_dir=Path("unused"), output_dir=Path(root) / "diagnostic")
+            ids = {"train": np.arange(16), "validation": np.arange(50, 58), "queries": np.arange(50, 54)}
+            with patch("contrastive_experiment.load_data", return_value=(train, validation, queries, labels, query_labels, ids)) as loader:
+                with patch("contrastive_experiment.train_paired", side_effect=AssertionError("Unexpected retraining")):
+                    diagnose_selected(args)
+                loader.assert_called_once_with(args.data_dir, 42, 16, 8, 4,
+                                               query_split="validation", dataset="kmnist", return_ids=True)
+            result = json.loads((args.output_dir / "diagnostics.json").read_text())
+            self.assertTrue(result["source_files_unchanged"])
+            self.assertTrue(result["results"][0]["median_score_matches_tuning"])
 
     def test_mnist_loader_uses_requested_official_dataset(self):
         class FakeDataset:

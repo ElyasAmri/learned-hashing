@@ -13,5 +13,6 @@ results/*
 !results/kmnist-unseen/
 !results/kmnist-itq-costs/
 !results/contrastive/
+!results/contrastive-itq-validation/
 results/*/*
 !results/*/*.json

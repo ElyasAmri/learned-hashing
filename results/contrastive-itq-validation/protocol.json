@@ -1,0 +1,44 @@
+{
+  "config": {
+    "dataset": "kmnist",
+    "query_split": "validation",
+    "seed": 42,
+    "bits": [
+      16,
+      32,
+      64
+    ],
+    "train_size": 50000,
+    "validation_size": 10000,
+    "query_size": 2000,
+    "itq_iterations": 50,
+    "encoders_retrained": false,
+    "device": "cuda",
+    "data_dir": "data",
+    "smoke": false
+  },
+  "selected_temperatures": {
+    "16": 0.5,
+    "32": 0.5,
+    "64": 0.2
+  },
+  "versions": {
+    "numpy": "2.2.6",
+    "torch": "2.11.0+cu128",
+    "torchvision": "0.26.0+cu128",
+    "sklearn": "1.7.2"
+  },
+  "source_sha256": {
+    "results\\contrastive\\tuning.json": "1261edba6a0410a7d8ef495fe44cf90953ce7d1301943cd95bc96f01ad84734f",
+    "results\\contrastive\\tuning-models\\bits-16-temperature-0.5\\transform.npz": "f4e6a03492aa6033a6dfe310bfb990f49041d07b50dad38a81866eb4ad854802",
+    "results\\contrastive\\tuning-models\\bits-16-temperature-0.5\\autoencoder.pt": "1eeb38a98aba3282a23cddfb9cebc2b04f80eb6452834d9bb8fbab075e4403ec",
+    "results\\contrastive\\tuning-models\\bits-32-temperature-0.5\\transform.npz": "36ec8a1fff49d14316a9c3da162be2d340e09385d596525cb97621af5a37c45e",
+    "results\\contrastive\\tuning-models\\bits-32-temperature-0.5\\autoencoder.pt": "353315a0f8c36ad53f0e5c165cd1b32268fc98242a071026ab1940197273db5c",
+    "results\\contrastive\\tuning-models\\bits-64-temperature-0.2\\transform.npz": "7872b81833f5d5834f673be69a0c9412a4e45f34bbd86414185989dc0f6afe12",
+    "results\\contrastive\\tuning-models\\bits-64-temperature-0.2\\autoencoder.pt": "ab0e43f9168f9c595fef61d2eef674b031f32e828109e8d5d4b4120a438b6422",
+    "results\\kmnist-itq-costs\\protocol.json": "62b38ab1a1b71db7706e473f9f2e35073ac0b2679d76953a109f660ce04a3d6d",
+    "results\\kmnist-itq-costs\\models\\seed-42\\pca_itq-16\\transform.npz": "d0f989cd045e4e8c2b4fc8c416d0af5e3c572f90a4c4e64bccd8fee7ef837e97",
+    "results\\kmnist-itq-costs\\models\\seed-42\\pca_itq-32\\transform.npz": "6d1d57de6c261fd4284960721e134b58c2f16a43fefed4a34868e56e642e50e9",
+    "results\\kmnist-itq-costs\\models\\seed-42\\pca_itq-64\\transform.npz": "0ce6f0d8778a09f988641c36d0604e3688f4c1107867e615ec7499a59d86be03"
+  }
+}

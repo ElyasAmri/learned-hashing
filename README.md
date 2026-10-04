@@ -329,6 +329,32 @@ Unlike the previous cost table, fitting times here are from the new MNIST run. N
 
 Reports and all nine tuning checkpoints plus 60 evaluation artifacts are in `results/contrastive/`. `protocol.json` reserves the complete setup before tuning; `tuning.json` records every candidate and fixed temperatures. Each evaluation report includes its tuning-report SHA-256, official split IDs, and class counts. Saved neural models passed validation-encoding/code reload checks, and PCA/ITQ transforms passed training-code reload checks. The full experiment did not change its settings after MNIST results. This is evidence for this shallow contrastive recipe, not a conclusion about all contrastive methods; repeated seeds share the official test pool and are not independent datasets or confidence intervals.
 
+## Contrastive ITQ: validation-only follow-up
+
+```powershell
+.venv/Scripts/python contrastive_experiment.py --diagnose-from results/contrastive --reference-itq-from results/kmnist-itq-costs --output-dir results/contrastive-itq-validation-next
+```
+
+This diagnostic reuses the selected seed-42 KMNIST contrastive encoders at temperatures 0.5/0.5/0.2, without retraining or changing the encoder weights. It fits one 50-iteration ITQ rotation per bit length on all 50,000 training embeddings, using training-mean centering and no whitening. Evaluation uses the same 2,000 validation queries previously used for temperature selection, against the 50,000 training database items. No MNIST or official test queries are loaded. The optional PCA + ITQ reference reuses its saved seed-42 KMNIST projection/rotation and is scored against the identical database and queries.
+
+These are **single-seed development precision@10 (%)**, not five-seed means or fresh test estimates:
+
+| Representation | 16 dimensions/bits | 32 dimensions/bits | 64 dimensions/bits |
+|---|---:|---:|---:|
+| Contrastive continuous Euclidean | 82.445 | 83.240 | 86.890 |
+| Contrastive continuous cosine | 83.075 | 83.735 | 87.855 |
+| Contrastive centered continuous cosine | 83.200 | 83.815 | 87.710 |
+| Contrastive median binary | 67.915 | 76.575 | 82.355 |
+| Contrastive centered sign | 69.490 | 76.355 | 82.475 |
+| Contrastive + ITQ binary | 73.490 | 78.290 | 84.310 |
+| PCA + ITQ reference | 72.295 | 82.435 | 88.710 |
+
+ITQ improved contrastive median codes by 5.575, 1.715, and 1.955 points. It also improved over the centered-sign control at every width, so the gain was not solely a change from median to mean thresholds. It exceeded PCA + ITQ by 1.195 points at 16 bits but remained 4.145 and 4.400 points behind at 32/64 bits. The original median-code scores reproduced the tuning report exactly. Continuous retrieval still exceeded contrastive binary retrieval, but uses float storage and a different distance metric, so it is not a same-budget comparison or a strict upper bound.
+
+The run took 36 seconds. All source files remained hash-identical; all three output encoder checkpoints are byte-identical copies of their originals. New artifacts retain the saved encoder and add only centering, rotation, and zero thresholds; inference parameter sizes are 402.81, 417.13, and 457.75 KiB. Reloaded ITQ artifacts matched training and validation query codes. Encoding speed was not remeasured in this diagnostic.
+
+Reports are in `results/contrastive-itq-validation/`, with source hashes, dataset row IDs, objective histories, and all seven retrieval variants. The two JSON reports are tracked; model files remain ignored. After `load_artifact`, use `saved_codes(transform, arrays, images, itq=True)` for rotated codes. `fit_itq_artifact` now supports both PCA and saved neural encoders. On a fresh clone, regenerate the selected KMNIST checkpoints and PCA ITQ artifacts before running the diagnostic.
+
 ## Next decision
 
-Contrastive training is a more promising learned objective than matched reconstruction here, especially at 16 bits, but PCA + ITQ still wins at 32/64 bits and is cheaper to encode. Keep both as baselines. Before increasing architecture complexity, diagnose the contrastive representation's continuous-to-binary loss on development data or test a training-only rotation. Do not tune against the now-inspected MNIST test results.
+Replicate contrastive + ITQ across additional development seeds before adopting it. The single-seed gain is promising, especially at 16 bits, but it does not establish a fresh-test improvement or close the 32/64-bit gap to PCA + ITQ. Keep the encoder frozen during that comparison and do not tune against the inspected MNIST test results.
