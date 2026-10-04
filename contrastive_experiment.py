@@ -53,8 +53,9 @@ def contrastive_loss(first, second, temperature):
 def paired_objective(model, batch, generator, objective, temperature):
     views = torch.cat([augment_views(batch, generator), augment_views(batch, generator)])
     latent = model.encoder(views)
-    if objective == "contrastive":
-        base = contrastive_loss(latent[:len(batch)], latent[len(batch):], temperature)
+    if objective in ["contrastive", "contrastive_projection"]:
+        embeddings = model.projection_head(latent) if objective == "contrastive_projection" else latent
+        base = contrastive_loss(embeddings[:len(batch)], embeddings[len(batch):], temperature)
     elif objective == "augmented_reconstruction":
         base = F.mse_loss(model.decoder(latent), views)
     else:
@@ -65,8 +66,11 @@ def paired_objective(model, batch, generator, objective, temperature):
 def train_paired(train, validation, bits, seed, objective, temperature, epochs, batch_size, device):
     torch.manual_seed(seed)
     model = Autoencoder(bits).to(device)
-    if objective == "contrastive":
+    if objective in ["contrastive", "contrastive_projection"]:
         model.decoder.requires_grad_(False)
+    if objective == "contrastive_projection":
+        model.projection_head = torch.nn.Sequential(torch.nn.Linear(bits, 128), torch.nn.ReLU(),
+                                                    torch.nn.Linear(128, 128)).to(device)
     optimizer = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=1e-3)
     loader = DataLoader(TensorDataset(torch.from_numpy(train)), batch_size=batch_size, shuffle=True,
                         generator=torch.Generator().manual_seed(seed))
@@ -106,17 +110,26 @@ def fit_paired_artifact(train, validation, bits, seed, objective, temperature, c
     start = time.perf_counter()
     model, history = train_paired(train, validation, bits, seed, objective, temperature,
                                   config["epochs"], config["batch_size"], device)
+    head = None
+    if objective == "contrastive_projection":
+        head = model.projection_head
+        del model.projection_head
     latent = encode(model, train, device)
     thresholds = np.median(latent, axis=0)
     fit_seconds = time.perf_counter() - start
     save_artifact(directory, "autoencoder", model, latent.mean(axis=0), thresholds, np.eye(bits),
                   binary_thresholds=thresholds)
+    if head is not None:
+        with (directory / "projection_head.pt").open("xb") as output:
+            torch.save({key: value.detach().cpu() for key, value in head.state_dict().items()}, output)
     transform, saved = load_artifact(directory, device)
     restored = transform(validation)
     expected = encode(model, validation, device)
     np.testing.assert_allclose(restored, expected, rtol=1e-5, atol=1e-5)
     np.testing.assert_array_equal(restored > saved["binary_thresholds"], expected > thresholds)
     return {"fit_seconds": fit_seconds, "validation_objective_by_epoch": history,
+            "projection_head": [bits, 128, 128] if head is not None else None,
+            "training_only_parameter_bytes": sum(p.numel() * p.element_size() for p in head.parameters()) if head is not None else 0,
             "best_validation_objective": min(history), "artifact_roundtrip": "passed",
             "training_quantization_mse": float(np.square(np.abs(latent) - 1).mean()),
             "inference_parameter_bytes": sum(p.numel() * p.element_size() for p in model.encoder.parameters())
@@ -182,7 +195,9 @@ def diagnose_selected(args):
     seed = config["tuning_seed"] if requested_seed is None else requested_seed
     if requested_seed is not None and seed not in config["seeds"]:
         raise ValueError("Diagnostic seed must belong to the frozen experiment's seed list")
-    train_new_encoder = seed != config["tuning_seed"]
+    use_projection = getattr(args, "projection_head", False)
+    objective = "contrastive_projection" if use_projection else "contrastive"
+    train_new_encoder = seed != config["tuning_seed"] or use_projection
     if train_new_encoder and config["quantization_weight"] != QUANTIZATION_WEIGHT:
         raise ValueError("Quantization weight differs from the frozen training recipe")
     selected = [next(r for r in tuning["results"] if r["bits"] == bits
@@ -206,6 +221,8 @@ def diagnose_selected(args):
                            "bits": config["bits"], "train_size": config["train_size"],
                            "validation_size": config["validation_size"], "query_size": config["tuning_queries"],
                            "itq_iterations": 50, "encoders_retrained": train_new_encoder, "device": args.device,
+                           "training_objective": objective, "projection_head": use_projection,
+                           "projection_head_width": 128 if use_projection else None,
                            "data_dir": str(args.data_dir), "smoke": config["smoke"]},
                 "source_training_config": config,
                 "selected_temperatures": tuning["selected_temperatures"], "versions": versions,
@@ -222,10 +239,11 @@ def diagnose_selected(args):
         source = Path(original["artifact_dir"])
         encoder_fit = None
         if train_new_encoder:
-            source = args.output_dir / "encoders" / f"contrastive-{bits}"
-            encoder_fit = fit_paired_artifact(train, validation, bits, seed, "contrastive", original["temperature"],
+            source = args.output_dir / "encoders" / f"{objective}-{bits}"
+            encoder_fit = fit_paired_artifact(train, validation, bits, seed, objective, original["temperature"],
                                               config, args.device, source)
-            for name in ["transform.npz", "autoencoder.pt"]:
+            files = ["transform.npz", "autoencoder.pt"] + (["projection_head.pt"] if use_projection else [])
+            for name in files:
                 path = source / name
                 hashes[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
         directory = args.output_dir / "models" / f"contrastive_itq-{bits}"
@@ -269,6 +287,7 @@ def main():
     parser.add_argument("--smoke", action="store_true", help="Reduced KMNIST-only validation run; never loads MNIST")
     parser.add_argument("--diagnose-from", type=Path, help="Diagnose selected KMNIST encoders with frozen settings")
     parser.add_argument("--diagnostic-seed", type=int, help="Replicate a frozen source seed; fit its encoder if not the tuning seed")
+    parser.add_argument("--projection-head", action="store_true", help="Diagnostic ablation: train with a bits/128/128 head, then discard it")
     parser.add_argument("--reference-itq-from", type=Path, help="Saved KMNIST PCA ITQ benchmark for the diagnostic")
     args = parser.parse_args()
     if args.diagnose_from is not None:
@@ -276,8 +295,8 @@ def main():
             parser.error("Diagnostic mode uses the source report's settings, not --stage or --smoke")
         diagnose_selected(args)
         return
-    if args.reference_itq_from is not None or args.diagnostic_seed is not None:
-        parser.error("--reference-itq-from and --diagnostic-seed require --diagnose-from")
+    if args.reference_itq_from is not None or args.diagnostic_seed is not None or args.projection_head:
+        parser.error("--reference-itq-from, --diagnostic-seed and --projection-head require --diagnose-from")
     config = {"bits": [16, 32, 64], "seeds": [42, 7, 21, 84, 123], "epochs": 20, "batch_size": 256,
               "train_size": 50000, "validation_size": 10000, "tuning_queries": 2000, "query_pool_size": 10000,
               "temperatures": [0.1, 0.2, 0.5], "quantization_weight": QUANTIZATION_WEIGHT,

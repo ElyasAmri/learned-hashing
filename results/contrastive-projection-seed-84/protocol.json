@@ -1,0 +1,89 @@
+{
+  "config": {
+    "dataset": "kmnist",
+    "query_split": "validation",
+    "seed": 84,
+    "bits": [
+      16,
+      32,
+      64
+    ],
+    "train_size": 50000,
+    "validation_size": 10000,
+    "query_size": 2000,
+    "itq_iterations": 50,
+    "encoders_retrained": true,
+    "device": "cuda",
+    "training_objective": "contrastive_projection",
+    "projection_head": true,
+    "projection_head_width": 128,
+    "data_dir": "data",
+    "smoke": false
+  },
+  "source_training_config": {
+    "bits": [
+      16,
+      32,
+      64
+    ],
+    "seeds": [
+      42,
+      7,
+      21,
+      84,
+      123
+    ],
+    "epochs": 20,
+    "batch_size": 256,
+    "train_size": 50000,
+    "validation_size": 10000,
+    "tuning_queries": 2000,
+    "query_pool_size": 10000,
+    "temperatures": [
+      0.1,
+      0.2,
+      0.5
+    ],
+    "quantization_weight": 0.001,
+    "tuning_dataset": "kmnist",
+    "evaluation_dataset": "mnist",
+    "evaluation_query_split": "test",
+    "threshold_rule": "training_median",
+    "tuning_seed": 42,
+    "smoke": false,
+    "data_dir": "data",
+    "device": "cuda",
+    "augmentation": {
+      "rotation_degrees": 10,
+      "scale": [
+        0.9,
+        1.1
+      ],
+      "grid_translation_pixels": 2,
+      "interpolation": "bilinear",
+      "padding": "zeros",
+      "flips": false
+    },
+    "checkpoint_selection": "minimum_fixed_view_validation_base_objective",
+    "projection_head": false,
+    "itq_iterations": 50
+  },
+  "selected_temperatures": {
+    "16": 0.5,
+    "32": 0.5,
+    "64": 0.2
+  },
+  "versions": {
+    "numpy": "2.2.6",
+    "torch": "2.11.0+cu128",
+    "torchvision": "0.26.0+cu128",
+    "sklearn": "1.7.2"
+  },
+  "source_sha256": {
+    "results\\contrastive\\tuning.json": "1261edba6a0410a7d8ef495fe44cf90953ce7d1301943cd95bc96f01ad84734f",
+    "results\\kmnist-itq-costs\\protocol.json": "62b38ab1a1b71db7706e473f9f2e35073ac0b2679d76953a109f660ce04a3d6d",
+    "results\\kmnist-itq-costs\\models\\seed-84\\pca_itq-16\\transform.npz": "e75356f0fc5b3139468240cf25b2565624c3345eaa12bd57122d115777900903",
+    "results\\kmnist-itq-costs\\models\\seed-84\\pca_itq-32\\transform.npz": "57ddadd98c8279e9ef80ca3a01121b8088dff7f50feb1589d9a560e87df63a3d",
+    "results\\kmnist-itq-costs\\models\\seed-84\\pca_itq-64\\transform.npz": "38d00a4e3987c88408d824680ea836cbe25cc1b26a79856249437421f5b4fdc6"
+  }
+}

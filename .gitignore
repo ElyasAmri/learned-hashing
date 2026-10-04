@@ -15,5 +15,6 @@ results/*
 !results/contrastive/
 !results/contrastive-itq-validation/
 !results/contrastive-itq-seed-*/
+!results/contrastive-projection-seed-*/
 results/*/*
 !results/*/*.json

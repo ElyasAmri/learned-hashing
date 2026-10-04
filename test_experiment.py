@@ -13,8 +13,8 @@ from sklearn.decomposition import PCA
 
 from benchmark_transfer import (evaluate_saved_databases, fit_itq_artifact, frozen_settings,
                                 measure_cpu_encoding, run_pca, saved_codes, unseen_partitions)
-from contrastive_experiment import (augment_views, contrastive_loss, diagnose_selected, latent_diagnostics,
-                                    select_temperatures, train_paired)
+from contrastive_experiment import (augment_views, contrastive_loss, diagnose_selected, fit_paired_artifact,
+                                    latent_diagnostics, paired_objective, select_temperatures, train_paired)
 from diagnose_quantization import continuous_neighbors, fit_itq, load_artifact, save_artifact
 from experiment import (Autoencoder, code_statistics, encode, evaluate, load_data,
                         hamming_neighbors, pair_distances, quantize, quantization_penalty, separation_penalty,
@@ -477,16 +477,51 @@ class ContrastiveTests(unittest.TestCase):
         validation = rng.random((8, 784), dtype=np.float32)
         torch.manual_seed(42)
         initial = Autoencoder(4)
-        for objective in ["contrastive", "augmented_reconstruction"]:
+        for objective in ["contrastive", "contrastive_projection", "augmented_reconstruction"]:
             model, history = train_paired(train, validation, 4, 42, objective, 0.2, 2, 8, "cpu")
             self.assertEqual(len(history), 2)
             self.assertTrue(np.isfinite(history).all())
             self.assertTrue(np.isfinite(encode(model, validation, "cpu")).all())
             self.assertTrue(any(not torch.equal(p, q) for p, q in zip(model.encoder.parameters(), initial.encoder.parameters())))
-            if objective == "contrastive":
+            if objective in ["contrastive", "contrastive_projection"]:
                 for p, q in zip(model.decoder.parameters(), initial.decoder.parameters()):
                     torch.testing.assert_close(p, q, rtol=0, atol=0)
                     self.assertFalse(p.requires_grad)
+
+    def test_projection_loss_trains_head_and_encoder_with_raw_quantization(self):
+        model = Autoencoder(4)
+        model.projection_head = torch.nn.Sequential(torch.nn.Linear(4, 128), torch.nn.ReLU(), torch.nn.Linear(128, 128))
+        batch = torch.rand(8, 784)
+        with patch("contrastive_experiment.quantization_penalty", wraps=quantization_penalty) as penalty:
+            base, quantization = paired_objective(model, batch, torch.Generator().manual_seed(42),
+                                                 "contrastive_projection", 0.2)
+            self.assertEqual(penalty.call_args.args[0].shape, (16, 4))
+        (base + 0.001 * quantization).backward()
+        for module in [model.encoder, model.projection_head]:
+            self.assertTrue(all(torch.isfinite(p.grad).all() for p in module.parameters()))
+            self.assertGreater(sum(p.grad.abs().sum().item() for p in module.parameters()), 0)
+        self.assertTrue(all(p.grad is None for p in model.decoder.parameters()))
+
+    def test_projection_head_is_excluded_from_inference_artifact(self):
+        rng = np.random.default_rng(42)
+        train = rng.random((16, 784), dtype=np.float32)
+        validation = rng.random((8, 784), dtype=np.float32)
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root) / "model"
+            result = fit_paired_artifact(train, validation, 4, 42, "contrastive_projection", 0.2,
+                                        {"epochs": 1, "batch_size": 8}, "cpu", directory)
+            self.assertEqual(result["projection_head"], [4, 128, 128])
+            self.assertEqual(result["artifact_roundtrip"], "passed")
+            state = torch.load(directory / "autoencoder.pt", weights_only=True, map_location="cpu")
+            self.assertFalse(any(key.startswith("projection_head.") for key in state))
+            model = Autoencoder(4)
+            model.load_state_dict(state)
+            head_state = torch.load(directory / "projection_head.pt", weights_only=True, map_location="cpu")
+            self.assertEqual(result["training_only_parameter_bytes"], sum(v.numel() * v.element_size() for v in head_state.values()))
+            transform, saved = load_artifact(directory)
+            np.testing.assert_array_equal(transform(validation), encode(model, validation, "cpu"))
+            encoder_bytes = sum(p.numel() * p.element_size() for p in model.encoder.parameters())
+            self.assertEqual(result["inference_parameter_bytes"], encoder_bytes + saved["binary_thresholds"].nbytes)
 
     def test_neural_itq_keeps_encoder_bytes_and_counts_parameters(self):
         rng = np.random.default_rng(42)
@@ -599,6 +634,18 @@ class ContrastiveTests(unittest.TestCase):
             self.assertEqual(result["selected_temperatures"], {"4": 0.2})
             self.assertIsNone(result["results"][0]["median_score_matches_tuning"])
             self.assertEqual(len(result["results"][0]["encoder_fit"]["validation_objective_by_epoch"]), 1)
+            args.diagnostic_seed = 42
+            args.projection_head = True
+            args.output_dir = Path(root) / "projection-diagnostic"
+            with patch("contrastive_experiment.load_data", return_value=data):
+                with patch("contrastive_experiment.train_paired", wraps=train_paired) as trainer:
+                    diagnose_selected(args)
+                    self.assertEqual(trainer.call_args.args[2:], (4, 42, "contrastive_projection", 0.2, 1, 8, "cpu"))
+            projected = json.loads((args.output_dir / "diagnostics.json").read_text())
+            self.assertTrue(projected["config"]["projection_head"])
+            self.assertTrue(projected["config"]["encoders_retrained"])
+            self.assertTrue(projected["source_files_unchanged"])
+            self.assertEqual(projected["results"][0]["encoder_fit"]["projection_head"], [4, 128, 128])
             args.diagnostic_seed = 99
             args.output_dir = Path(root) / "invalid-seed"
             with self.assertRaisesRegex(ValueError, "frozen experiment's seed list"):

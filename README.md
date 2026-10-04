@@ -384,6 +384,36 @@ Paired ITQ gains over contrastive median codes were **3.58 +/- 1.38, 1.36 +/- 0.
 
 The four replications took 5 minutes 48 seconds combined. Reports are in `results/contrastive-itq-seed-{7,21,84,123}/`; seed 42 remains in `results/contrastive-itq-validation/`. Each new report retains its frozen source training configuration, fitting histories, split IDs, reference/source hashes, and all seven retrieval variants. All encoder copies stayed byte-identical through rotation; all 15 ITQ artifacts across five seeds passed reload checks. Raw model files remain excluded from Git. Encoding speed was not remeasured.
 
+## Training-only projection-head ablation
+
+```powershell
+foreach ($seed in 42,7,21,84,123) {
+    .venv/Scripts/python contrastive_experiment.py --diagnose-from results/contrastive --diagnostic-seed $seed --projection-head --reference-itq-from results/kmnist-itq-costs --output-dir "results/contrastive-projection-seed-$seed-next"
+    if ($LASTEXITCODE -ne 0) { throw "Projection-head experiment failed for seed $seed" }
+}
+```
+
+This predeclared ablation adds a training-only `bits -> 128 -> 128` MLP with one ReLU and no batch normalization. NT-Xent uses the normalized projection-head outputs, while the 0.001 quantization penalty still applies to raw encoder coordinates. The head is initialized after the unchanged encoder/decoder, preserving the paired seed's encoder initialization; minibatch ordering and augmentation generators are unchanged. Temperatures remain 0.5/0.5/0.2, with the same Adam settings, 20 epochs, and fixed-view validation-objective checkpoint selection. There is no head-size or temperature search and no MNIST/test evaluation.
+
+All 15 encoders are trained from scratch for this variant, including seed 42. Each selected checkpoint is then split into the ordinary encoder artifact and a separate `projection_head.pt` for provenance. The head is not used for encoding, thresholding, or ITQ. It adds 73/81/97 KiB of training-only parameters at 16/32/64 bits but leaves inference architecture and parameter sizes unchanged. The encoder is frozen before the 50-iteration training-only ITQ fit. This option is restricted to diagnostic mode and does not change the default headless recipe.
+
+The experiment uses exactly the previous five-seed KMNIST validation splits: 50,000 training/database images and 2,000 validation queries per seed. Mean +/- sample standard deviation of precision@10 (%):
+
+| Representation | 16 dimensions/bits | 32 dimensions/bits | 64 dimensions/bits |
+|---|---:|---:|---:|
+| Projection-trained encoder, continuous Euclidean | 78.36 +/- 0.70 | 80.64 +/- 0.92 | 83.53 +/- 0.50 |
+| Projection-trained encoder, continuous cosine | 79.17 +/- 0.70 | 82.12 +/- 0.70 | 84.96 +/- 0.53 |
+| Projection-trained encoder, centered cosine | 78.49 +/- 0.66 | 80.95 +/- 1.02 | 83.76 +/- 0.55 |
+| Projection-trained encoder, median binary | 59.69 +/- 1.62 | 69.27 +/- 1.20 | 76.66 +/- 1.08 |
+| Projection-trained encoder, centered sign | 59.73 +/- 1.57 | 68.63 +/- 1.62 | 76.18 +/- 1.13 |
+| Projection-trained encoder + ITQ | 61.43 +/- 1.79 | 70.39 +/- 1.19 | 76.77 +/- 0.63 |
+| Headless contrastive + ITQ control | 72.93 +/- 1.17 | 77.66 +/- 1.20 | 84.72 +/- 0.93 |
+| PCA + ITQ reference | 72.75 +/- 1.18 | 83.16 +/- 0.84 | 88.91 +/- 0.49 |
+
+The projector-trained variant lost to headless contrastive + ITQ in all 15 comparisons. Paired mean changes were **-11.50, -7.27, and -7.95 percentage points**. Its median-code means also fell from 69.34/76.29/82.37 to 59.69/69.27/76.66%. Raw-encoder continuous cosine retrieval fell from 83.42/83.50/87.99 to 79.17/82.12/84.96%, so the degradation appeared before binarization as well. This rejects this particular fixed projection-head recipe, not projection heads generally; the temperatures were inherited from the headless model rather than retuned.
+
+The five runs took 8 minutes 53 seconds combined. Reports are in `results/contrastive-projection-seed-{42,7,21,84,123}/`. Every neural and ITQ artifact passed reload checks. All inference checkpoints exclude head parameters, and encoder bytes remain unchanged through ITQ. Split IDs and PCA-reference scores exactly matched the headless comparisons. The new JSON reports are tracked; model/head files remain ignored. Inference parameter sizes after ITQ remain 402.81/417.13/457.75 KiB; encoding speed was not remeasured.
+
 ## Next decision
 
-Use contrastive + ITQ as the improved neural baseline: its gain over unrotated contrastive codes replicated, but it does not establish superiority to PCA + ITQ. The classical baseline remains cheaper and clearly stronger at 32/64 bits in this diagnostic. Further learned-hashing changes should address representation or quantization quality through a predeclared development ablation, not another search on inspected test results.
+Do not adopt this projection-head variant. Keep headless contrastive + ITQ as the neural baseline and PCA + ITQ as the stronger practical reference at 32/64 bits. A subsequent change should directly address hash-coordinate quality, such as an isolated bit-decorrelation ablation, and stay on development data rather than tune against inspected test results.

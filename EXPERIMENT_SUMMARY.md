@@ -222,6 +222,27 @@ ITQ improved contrastive median codes by 3.58, 1.36, and 2.35 points, winning al
 
 The four replications took 5 minutes 48 seconds combined, fitting 12 encoders before freezing them for comparison. Reports are in `results/contrastive-itq-seed-7/`, `results/contrastive-itq-seed-21/`, `results/contrastive-itq-seed-84/`, and `results/contrastive-itq-seed-123/`, alongside the seed-42 report in `results/contrastive-itq-validation/`. Model copies remained byte-identical through rotation. Encoding cost was not remeasured.
 
+## 6d. Training-only projection head: negative result
+
+This five-seed KMNIST validation ablation added a `bits -> 128 -> 128` ReLU head for the contrastive loss and discarded it before hashing. The encoder, augmentations, original temperatures 0.5/0.5/0.2, weak raw-latent quantization penalty, training duration, and ITQ settings stayed fixed. All 15 variant encoders were trained from scratch, then frozen for ITQ. No head-size search, temperature retuning, or MNIST/test evaluation was performed.
+
+Five-seed mean validation precision@10 (%) on the same 50,000-item training database and 2,000 validation queries per seed:
+
+| Representation | 16 dimensions/bits | 32 dimensions/bits | 64 dimensions/bits |
+|---|---:|---:|---:|
+| Projection-trained encoder, continuous Euclidean | 78.36 | 80.64 | 83.53 |
+| Projection-trained encoder, continuous cosine | 79.17 | 82.12 | 84.96 |
+| Projection-trained encoder, centered cosine | 78.49 | 80.95 | 83.76 |
+| Projection-trained encoder, median binary | 59.69 | 69.27 | 76.66 |
+| Projection-trained encoder, centered sign | 59.73 | 68.63 | 76.18 |
+| Projection-trained encoder + ITQ | 61.43 | 70.39 | 76.77 |
+| Headless contrastive + ITQ control | 72.93 | 77.66 | 84.72 |
+| PCA + ITQ reference | 72.75 | 83.16 | 88.91 |
+
+The head variant lost to the headless ITQ control in all 15 comparisons, by 11.50, 7.27, and 7.95 points on average. Its raw continuous retrieval also worsened. The extra head added 73/81/97 KiB of training-only parameters but no inference parameters; it is saved separately and absent from inference encoder checkpoints. This is a negative result for the fixed recipe, not a general conclusion about projection heads. The headless configuration remains the default.
+
+The runs took 8 minutes 53 seconds combined. Reports are in `results/contrastive-projection-seed-{42,7,21,84,123}/`. Every variant used identical split IDs and PCA-reference scores to the preceding comparison, and encoder bytes remained unchanged during ITQ. Encoding speed was not remeasured.
+
 ## 7. Every tuning configuration
 
 All tables in this section use seed 42, 2,000 validation queries, and a 50,000-image training database. These are selection scores, not the five-seed evaluation results above. Bold scores identify the selected configuration per bit length and penalty family.
@@ -314,6 +335,7 @@ PCA/ITQ fit on CPU; neural training used CUDA. Fits include validation where app
 7. Contrastive training is the most promising learned configuration tried here, especially at 16 bits.
 8. PCA + ITQ remained the better accuracy/cost choice at 32/64 bits in the latest five-seed evaluation.
 9. Adding ITQ to contrastive encoders improved all three widths in every development seed, but did not close the higher-bit gap to PCA + ITQ; the 16-bit aggregate was only a near tie.
+10. A fixed training-only projection head substantially worsened raw-encoder retrieval, with and without ITQ, despite leaving inference size unchanged. It was not adopted.
 
 Development queries were reused extensively and baseline tuning budgets were not identical. MNIST was held for the frozen contrastive comparison, but is now inspected too. No state-of-the-art or universal superiority claim is supported, and these test pools should not be used for more tuning.
 
@@ -322,5 +344,5 @@ Development queries were reused extensively and baseline tuning budgets were not
 - The first Fashion-MNIST ITQ run stopped on one PCA bit changing after reload because memory layout affected rounding near a threshold. Canonical contiguous components fixed it; the full rerun supplied the reported results.
 - The first KMNIST download failed TLS validation. Official archives were downloaded through certificate-checked Windows HTTPS and matched to torchvision's digests; certificate checks were not disabled.
 - Smoke tests checked execution paths, not model quality. Smoke and interrupted-run reports are excluded from the published result bundle.
-- The latest experiment development test run had 41 passing unit tests, plus compilation and dependency checks.
+- The latest experiment development test run had 43 passing unit tests, plus compilation and dependency checks.
 - Public JSON reports retain configurations, per-seed metrics, tuning candidates, split IDs where recorded, validation histories, timing samples, and provenance hashes. Artifact paths refer to local checkpoints that must be regenerated; their presence in JSON does not mean checkpoints are published.
