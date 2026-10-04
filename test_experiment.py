@@ -1,3 +1,4 @@
+import hashlib
 import json
 import tempfile
 import unittest
@@ -13,8 +14,9 @@ from sklearn.decomposition import PCA
 
 from benchmark_transfer import (evaluate_saved_databases, fit_itq_artifact, frozen_settings,
                                 measure_cpu_encoding, run_pca, saved_codes, unseen_partitions)
-from contrastive_experiment import (augment_views, contrastive_loss, diagnose_selected, fit_paired_artifact,
-                                    latent_diagnostics, paired_objective, select_temperatures, train_paired)
+from contrastive_experiment import (augment_views, contrastive_loss, decorrelation_penalty, diagnose_selected,
+                                    fit_paired_artifact, latent_diagnostics, paired_objective,
+                                    select_decorrelation_weights, select_temperatures, train_paired, tune_decorrelation)
 from diagnose_quantization import continuous_neighbors, fit_itq, load_artifact, save_artifact
 from experiment import (Autoencoder, code_statistics, encode, evaluate, load_data,
                         hamming_neighbors, pair_distances, quantize, quantization_penalty, separation_penalty,
@@ -493,7 +495,7 @@ class ContrastiveTests(unittest.TestCase):
         model.projection_head = torch.nn.Sequential(torch.nn.Linear(4, 128), torch.nn.ReLU(), torch.nn.Linear(128, 128))
         batch = torch.rand(8, 784)
         with patch("contrastive_experiment.quantization_penalty", wraps=quantization_penalty) as penalty:
-            base, quantization = paired_objective(model, batch, torch.Generator().manual_seed(42),
+            base, quantization, _ = paired_objective(model, batch, torch.Generator().manual_seed(42),
                                                  "contrastive_projection", 0.2)
             self.assertEqual(penalty.call_args.args[0].shape, (16, 4))
         (base + 0.001 * quantization).backward()
@@ -646,10 +648,90 @@ class ContrastiveTests(unittest.TestCase):
             self.assertTrue(projected["config"]["encoders_retrained"])
             self.assertTrue(projected["source_files_unchanged"])
             self.assertEqual(projected["results"][0]["encoder_fit"]["projection_head"], [4, 128, 128])
+            args.projection_head = False
+            args.output_dir = Path(root) / "decorrelated-diagnostic"
+            args.decorrelation_from = Path(root) / "decorrelation-tuning.json"
+            selection = {"source_tuning_sha256": hashlib.sha256((source / "tuning.json").read_bytes()).hexdigest(),
+                         "versions": report["versions"], "selection_metric": "itq_binary.validation_precision_at_10",
+                         "selected_weights": {"4": 0.01}}
+            args.decorrelation_from.write_text(json.dumps(selection))
+            with patch("contrastive_experiment.load_data", return_value=data):
+                with patch("contrastive_experiment.train_paired", wraps=train_paired) as trainer:
+                    with patch("contrastive_experiment.select_decorrelation_weights", side_effect=AssertionError("Unexpected retuning")):
+                        diagnose_selected(args)
+                    self.assertEqual(trainer.call_args.kwargs["decorrelation_weight"], 0.01)
+            decorrelated = json.loads((args.output_dir / "diagnostics.json").read_text())
+            self.assertEqual(decorrelated["config"]["decorrelation_weights"], {"4": 0.01})
+            self.assertEqual(decorrelated["results"][0]["encoder_fit"]["decorrelation_weight"], 0.01)
+            self.assertTrue(decorrelated["source_files_unchanged"])
             args.diagnostic_seed = 99
             args.output_dir = Path(root) / "invalid-seed"
             with self.assertRaisesRegex(ValueError, "frozen experiment's seed list"):
                 diagnose_selected(args)
+
+    def test_decorrelation_known_values_and_constant_coordinates(self):
+        independent = torch.tensor([[1., 1.], [1., -1.], [-1., 1.], [-1., -1.]])
+        self.assertEqual(decorrelation_penalty(independent).item(), 0)
+        self.assertAlmostEqual(decorrelation_penalty(independent[:, [0, 0]]).item(), 1)
+        constant = torch.ones(8, 4, requires_grad=True)
+        loss = decorrelation_penalty(constant)
+        self.assertEqual(loss.item(), 0)
+        loss.backward()
+        self.assertTrue(torch.isfinite(constant.grad).all())
+
+    def test_decorrelation_is_shift_scale_invariant_above_floor(self):
+        rng = np.random.default_rng(42)
+        latent = torch.tensor(rng.normal(size=(32, 4)), requires_grad=True)
+        transformed = latent * torch.tensor([2., 3., 4., 5.]) + torch.tensor([10., -3., 5., 8.])
+        loss = decorrelation_penalty(latent)
+        torch.testing.assert_close(loss, decorrelation_penalty(transformed), rtol=1e-10, atol=1e-10)
+        loss.backward()
+        self.assertTrue(torch.isfinite(latent.grad).all())
+        self.assertGreater(latent.grad.abs().sum().item(), 0)
+
+    def test_decorrelation_zero_control_and_positive_weight_training(self):
+        rng = np.random.default_rng(42)
+        train = rng.random((16, 784), dtype=np.float32)
+        validation = rng.random((8, 784), dtype=np.float32)
+        baseline, history = train_paired(train, validation, 4, 42, "contrastive", 0.2, 1, 8, "cpu")
+        zero, zero_history = train_paired(train, validation, 4, 42, "contrastive", 0.2, 1, 8, "cpu", 0)
+        self.assertEqual(history, zero_history)
+        for name, value in baseline.state_dict().items():
+            torch.testing.assert_close(value, zero.state_dict()[name], rtol=0, atol=0)
+        with patch("contrastive_experiment.decorrelation_penalty", wraps=decorrelation_penalty) as penalty:
+            model, history = train_paired(train, validation, 4, 42, "contrastive", 0.2, 1, 8, "cpu", 0.01)
+            self.assertEqual(penalty.call_count, 2)
+        self.assertTrue(np.isfinite(history).all())
+        self.assertTrue(np.isfinite(encode(model, validation, "cpu")).all())
+
+    def test_decorrelation_selection_prefers_zero_on_a_tie(self):
+        rows = [{"bits": 16, "decorrelation_weight": w, "validation_precision_at_10": score}
+                for w, score in [(0, 0.7), (0.001, 0.7), (0.01, 0.6), (0.1, 0.5)]]
+        self.assertEqual(select_decorrelation_weights(rows, [16]), {"16": 0})
+
+    def test_decorrelation_sweep_selects_itq_not_median_scores(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "source"
+            source.mkdir()
+            tuning = {"config": {"tuning_seed": 42, "bits": [4]}, "versions": {}, "selected_temperatures": {"4": 0.2}}
+            (source / "tuning.json").write_text(json.dumps(tuning))
+            args = SimpleNamespace(diagnose_from=source, output_dir=Path(root) / "sweep")
+            scores = {0: 0.5, 0.001: 0.7, 0.01: 0.6, 0.1: 0.4}
+
+            def fake_diagnostic(candidate):
+                candidate.output_dir.mkdir()
+                score = scores[candidate.decorrelation_weight]
+                result = {"bits": 4, "decorrelation_weight": candidate.decorrelation_weight,
+                          "retrieval": {"itq_binary": {"validation_precision_at_10": score},
+                                        "median_binary": {"validation_precision_at_10": 1 - score}}}
+                (candidate.output_dir / "diagnostics.json").write_text(json.dumps({"results": [result]}))
+
+            with patch("contrastive_experiment.diagnose_selected", side_effect=fake_diagnostic) as diagnose:
+                tune_decorrelation(args)
+                self.assertEqual([call.args[0].decorrelation_weight for call in diagnose.call_args_list], [0, 0.001, 0.01, 0.1])
+            report = json.loads((args.output_dir / "tuning.json").read_text())
+            self.assertEqual(report["selected_weights"], {"4": 0.001})
+            self.assertEqual(report["selection_metric"], "itq_binary.validation_precision_at_10")
 
     def test_mnist_loader_uses_requested_official_dataset(self):
         class FakeDataset:

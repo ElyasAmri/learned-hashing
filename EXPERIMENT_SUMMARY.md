@@ -243,6 +243,29 @@ The head variant lost to the headless ITQ control in all 15 comparisons, by 11.5
 
 The runs took 8 minutes 53 seconds combined. Reports are in `results/contrastive-projection-seed-{42,7,21,84,123}/`. Every variant used identical split IDs and PCA-reference scores to the preceding comparison, and encoder bytes remained unchanged during ITQ. Encoding speed was not remeasured.
 
+## 6e. Latent-coordinate decorrelation: no reliable gain
+
+This headless ablation adds the mean squared off-diagonal correlation of raw latent coordinates, pooled across both augmented views, to the existing contrastive and quantization losses. Variances are floored at 1e-4; constant coordinates are not penalized, so this is not standalone collapse prevention. Temperatures, architecture, augmentations, training duration, checkpoint rule, and ITQ settings remain fixed.
+
+Weights 0, 0.001, 0.01, and 0.1 were selected on seed-42 KMNIST validation by **post-ITQ precision@10**, with the zero-weight control included and ties favoring smaller weights. The selected weights were **0 / 0 / 0.001** for 16/32/64 bits, then held fixed across five seeds. No projection head or MNIST/test evaluation was used.
+
+Five-seed mean validation precision@10 (%), on the same 50,000 training/database images and 2,000 queries per seed:
+
+| Representation | 16 dimensions/bits | 32 dimensions/bits | 64 dimensions/bits |
+|---|---:|---:|---:|
+| Selected-setting continuous Euclidean | 82.92 | 83.05 | 87.38 |
+| Selected-setting continuous cosine | 83.42 | 83.50 | 88.09 |
+| Selected-setting centered cosine | 83.47 | 83.55 | 88.07 |
+| Selected-setting median binary | 69.34 | 76.29 | 82.42 |
+| Selected-setting centered sign | 69.46 | 76.24 | 82.40 |
+| Selected-setting ITQ binary | 72.93 | 77.66 | 84.53 |
+| Original headless contrastive + ITQ | 72.93 | 77.66 | 84.72 |
+| PCA + ITQ reference | 72.75 | 83.16 | 88.91 |
+
+The zero-weight controls reproduced all earlier 16/32-bit scores exactly. The selected 64-bit penalty lost 0.19 points on average against the original ITQ baseline and won only 2/5 seeds; its small seed-42 gain did not replicate. Some stronger weights reduced correlation without improving the selected retrieval metric. Decorrelation was not adopted as a default.
+
+Tuning took 6 minutes 26 seconds; fixed-weight evaluation took 8 minutes 14 seconds. Reports are in `results/contrastive-decorrelation-tuning/` and `results/contrastive-decorrelation-seed-{42,7,21,84,123}/`. All weights were frozen before the five-seed comparison. Reloads, source hashes, unchanged encoder copies through ITQ, identical inference sizes, and matched validation IDs/PCA scores were checked. Inference speed was not remeasured, and these are reused development data rather than fresh test estimates.
+
 ## 7. Every tuning configuration
 
 All tables in this section use seed 42, 2,000 validation queries, and a 50,000-image training database. These are selection scores, not the five-seed evaluation results above. Bold scores identify the selected configuration per bit length and penalty family.
@@ -291,6 +314,17 @@ Quantization weight remained 0.001 and thresholds remained training medians.
 | 0.2 | 64.730 | 75.835 | **82.355** |
 | 0.5 | **67.915** | **76.575** | 79.510 |
 
+### E. Decorrelation weights on KMNIST
+
+Each cell is **post-ITQ / median binary**. Selection used post-ITQ retrieval only; temperature and quantization weight stayed fixed.
+
+| Weight | 16 bits | 32 bits | 64 bits |
+|---|---:|---:|---:|
+| 0 | **73.490** / 67.915 | **78.290** / 76.575 | 84.310 / 82.355 |
+| 0.001 | 72.475 / 68.710 | 77.400 / 76.695 | **84.625** / 82.135 |
+| 0.01 | 72.940 / 69.240 | 77.485 / 76.460 | 84.600 / 82.545 |
+| 0.1 | 72.910 / 69.620 | 78.085 / 77.360 | 84.205 / 82.370 |
+
 ## 8. Computational cost
 
 Encoding measurements use one CPU thread, two warm-up runs, and seven measured repeats. They include encoding, thresholding, and packing 5,000 images already in RAM, but exclude loading and search. Entries average each seed's median elapsed time; they are not single-query latency or GPU serving measurements.
@@ -336,6 +370,7 @@ PCA/ITQ fit on CPU; neural training used CUDA. Fits include validation where app
 8. PCA + ITQ remained the better accuracy/cost choice at 32/64 bits in the latest five-seed evaluation.
 9. Adding ITQ to contrastive encoders improved all three widths in every development seed, but did not close the higher-bit gap to PCA + ITQ; the 16-bit aggregate was only a near tie.
 10. A fixed training-only projection head substantially worsened raw-encoder retrieval, with and without ITQ, despite leaving inference size unchanged. It was not adopted.
+11. A decorrelation sweep selected the unmodified control at 16/32 bits, and the selected 64-bit penalty failed to improve the five-seed mean. Lower correlation alone did not establish better retrieval.
 
 Development queries were reused extensively and baseline tuning budgets were not identical. MNIST was held for the frozen contrastive comparison, but is now inspected too. No state-of-the-art or universal superiority claim is supported, and these test pools should not be used for more tuning.
 
@@ -344,5 +379,5 @@ Development queries were reused extensively and baseline tuning budgets were not
 - The first Fashion-MNIST ITQ run stopped on one PCA bit changing after reload because memory layout affected rounding near a threshold. Canonical contiguous components fixed it; the full rerun supplied the reported results.
 - The first KMNIST download failed TLS validation. Official archives were downloaded through certificate-checked Windows HTTPS and matched to torchvision's digests; certificate checks were not disabled.
 - Smoke tests checked execution paths, not model quality. Smoke and interrupted-run reports are excluded from the published result bundle.
-- The latest experiment development test run had 43 passing unit tests, plus compilation and dependency checks.
+- The latest experiment development test run had 48 passing unit tests, plus compilation and dependency checks.
 - Public JSON reports retain configurations, per-seed metrics, tuning candidates, split IDs where recorded, validation histories, timing samples, and provenance hashes. Artifact paths refer to local checkpoints that must be regenerated; their presence in JSON does not mean checkpoints are published.

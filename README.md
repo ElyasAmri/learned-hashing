@@ -414,6 +414,50 @@ The projector-trained variant lost to headless contrastive + ITQ in all 15 compa
 
 The five runs took 8 minutes 53 seconds combined. Reports are in `results/contrastive-projection-seed-{42,7,21,84,123}/`. Every neural and ITQ artifact passed reload checks. All inference checkpoints exclude head parameters, and encoder bytes remain unchanged through ITQ. Split IDs and PCA-reference scores exactly matched the headless comparisons. The new JSON reports are tracked; model/head files remain ignored. Inference parameter sizes after ITQ remain 402.81/417.13/457.75 KiB; encoding speed was not remeasured.
 
+## Latent decorrelation: zero-controlled ablation
+
+```powershell
+.venv/Scripts/python contrastive_experiment.py --diagnose-from results/contrastive --tune-decorrelation --reference-itq-from results/kmnist-itq-costs --output-dir results/contrastive-decorrelation-tuning-next
+foreach ($seed in 42,7,21,84,123) {
+    .venv/Scripts/python contrastive_experiment.py --diagnose-from results/contrastive --diagnostic-seed $seed --decorrelation-from results/contrastive-decorrelation-tuning-next/tuning.json --reference-itq-from results/kmnist-itq-costs --output-dir "results/contrastive-decorrelation-seed-$seed-next"
+    if ($LASTEXITCODE -ne 0) { throw "Decorrelation evaluation failed for seed $seed" }
+}
+```
+
+The headless loss adds `weight * mean(off_diagonal_correlation(z)^2)` to NT-Xent and the existing 0.001 quantization term. Correlations are computed from raw latent coordinates pooled over both augmented views, after centering and division by coordinate standard deviation. Variances are floored at 1e-4 for numerical stability. The mean excludes the diagonal and is normalized over coordinate pairs, so its scale does not simply grow with bit length. Constant coordinates contribute zero correlation; this term is not a standalone collapse-prevention loss or a guarantee of independent binary bits.
+
+The grid **0, 0.001, 0.01, 0.1** was fixed before running. Selection uses **post-ITQ validation precision@10**, not median-code quality or the correlation statistic; ties favor the smaller weight. Seed 42 uses the same 2,000 KMNIST validation queries against 50,000 training images. The zero candidate reuses the original encoder checkpoints. Temperatures 0.5/0.5/0.2, augmentations, 20 epochs, batch size, base-validation-objective checkpoint selection, and 50 ITQ iterations are unchanged. No projection head or MNIST/test evaluation is used.
+
+Single-seed tuning scores (%); each cell is **post-ITQ / median binary**:
+
+| Decorrelation weight | 16 bits | 32 bits | 64 bits |
+|---|---:|---:|---:|
+| 0 | **73.490** / 67.915 | **78.290** / 76.575 | 84.310 / 82.355 |
+| 0.001 | 72.475 / 68.710 | 77.400 / 76.695 | **84.625** / 82.135 |
+| 0.01 | 72.940 / 69.240 | 77.485 / 76.460 | 84.600 / 82.545 |
+| 0.1 | 72.910 / 69.620 | 78.085 / 77.360 | 84.205 / 82.370 |
+
+Selected weights were **0 / 0 / 0.001**. These choices were fixed before the five-seed evaluation. New encoders were fitted where required and frozen before ITQ; the selected-weight report is checked against the original temperature-tuning SHA-256 and selection rule. Zero-weight controls exactly reproduced every previous retrieval score at 16/32 bits.
+
+Five-seed KMNIST validation precision@10 (%), mean +/- sample standard deviation:
+
+| Representation | 16 dimensions/bits | 32 dimensions/bits | 64 dimensions/bits |
+|---|---:|---:|---:|
+| Selected-setting continuous Euclidean | 82.92 +/- 0.98 | 83.05 +/- 0.97 | 87.38 +/- 0.80 |
+| Selected-setting continuous cosine | 83.42 +/- 1.05 | 83.50 +/- 0.82 | 88.09 +/- 0.73 |
+| Selected-setting centered cosine | 83.47 +/- 1.01 | 83.55 +/- 0.80 | 88.07 +/- 0.70 |
+| Selected-setting median binary | 69.34 +/- 2.04 | 76.29 +/- 1.52 | 82.42 +/- 0.96 |
+| Selected-setting centered sign | 69.46 +/- 1.61 | 76.24 +/- 1.44 | 82.40 +/- 0.89 |
+| Selected-setting ITQ binary | 72.93 +/- 1.17 | 77.66 +/- 1.20 | 84.53 +/- 0.82 |
+| Original headless contrastive + ITQ | 72.93 +/- 1.17 | 77.66 +/- 1.20 | 84.72 +/- 0.93 |
+| PCA + ITQ reference | 72.75 +/- 1.18 | 83.16 +/- 0.84 | 88.91 +/- 0.49 |
+
+At 64 bits, the seed-42 tuning gain of 0.315 points did not replicate: the five-seed mean change was **-0.19 +/- 0.38 points**, with wins in 2/5 seeds. At 16/32 bits the selected method is the unmodified control. Higher weights reduced raw-coordinate correlation in some tuning runs without improving the primary retrieval metric. All recorded full-training coordinate variances stayed well above the numerical floor. Decorrelation remains disabled by default; this is no reliable improvement over the existing neural baseline.
+
+Tuning took 6 minutes 26 seconds (12 candidate evaluations, nine newly fitted encoders). Fixed-weight evaluation took 8 minutes 14 seconds (15 comparisons, 13 newly fitted encoders and two reused controls). These are reused development queries, not fresh test estimates; seed 42 contributed to selection and evaluation. No inference parameters were added, and encoding speed was not remeasured.
+
+`results/contrastive-decorrelation-tuning/tuning.json` retains all candidate metrics, histories, source hashes, and selected weights; full per-candidate diagnostics and checkpoints remain local below that directory. Evaluation reports are in `results/contrastive-decorrelation-seed-{42,7,21,84,123}/`. All encoder and ITQ reload checks passed; encoder copies stayed byte-identical during rotation, and validation IDs and PCA-reference scores matched the prior controls. The compact tuning and evaluation JSON reports are tracked; model files stay ignored.
+
 ## Next decision
 
-Do not adopt this projection-head variant. Keep headless contrastive + ITQ as the neural baseline and PCA + ITQ as the stronger practical reference at 32/64 bits. A subsequent change should directly address hash-coordinate quality, such as an isolated bit-decorrelation ablation, and stay on development data rather than tune against inspected test results.
+Keep headless contrastive + ITQ without the projection head or decorrelation penalty as the neural baseline. Both additions failed to improve the chosen retrieval objective reliably. PCA + ITQ remains the stronger practical reference at 32/64 bits. Stop adding generic regularizers without a targeted hypothesis about the remaining representation or binarization gap, and do not tune on the inspected test sets.

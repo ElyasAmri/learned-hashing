@@ -16,5 +16,7 @@ results/*
 !results/contrastive-itq-validation/
 !results/contrastive-itq-seed-*/
 !results/contrastive-projection-seed-*/
+!results/contrastive-decorrelation-tuning/
+!results/contrastive-decorrelation-seed-*/
 results/*/*
 !results/*/*.json

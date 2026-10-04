@@ -5,6 +5,7 @@ import hashlib
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import sklearn
@@ -22,6 +23,16 @@ from penalty_experiment import save_report
 
 
 QUANTIZATION_WEIGHT = 0.001
+DECORRELATION_VARIANCE_FLOOR = 1e-4
+
+
+def decorrelation_penalty(latent):
+    centered = latent - latent.mean(dim=0)
+    variance = centered.square().mean(dim=0).clamp_min(DECORRELATION_VARIANCE_FLOOR)
+    normalized = centered / variance.sqrt()
+    correlation = normalized.T @ normalized / len(latent)
+    off_diagonal = ~torch.eye(latent.shape[1], dtype=torch.bool, device=latent.device)
+    return correlation[off_diagonal].square().mean()
 
 
 def augment_views(images, generator):
@@ -60,10 +71,11 @@ def paired_objective(model, batch, generator, objective, temperature):
         base = F.mse_loss(model.decoder(latent), views)
     else:
         raise ValueError(f"Unknown objective: {objective}")
-    return base, quantization_penalty(latent)
+    return base, quantization_penalty(latent), latent
 
 
-def train_paired(train, validation, bits, seed, objective, temperature, epochs, batch_size, device):
+def train_paired(train, validation, bits, seed, objective, temperature, epochs, batch_size, device,
+                 decorrelation_weight=0.0):
     torch.manual_seed(seed)
     model = Autoencoder(bits).to(device)
     if objective in ["contrastive", "contrastive_projection"]:
@@ -82,8 +94,10 @@ def train_paired(train, validation, bits, seed, objective, temperature, epochs, 
         for (batch,) in loader:
             batch = batch.to(device)
             optimizer.zero_grad()
-            base, quantization = paired_objective(model, batch, training_rng, objective, temperature)
+            base, quantization, latent = paired_objective(model, batch, training_rng, objective, temperature)
             loss = base + QUANTIZATION_WEIGHT * quantization
+            if decorrelation_weight > 0:
+                loss = loss + decorrelation_weight * decorrelation_penalty(latent)
             if not torch.isfinite(loss):
                 raise FloatingPointError("Non-finite paired training loss")
             loss.backward()
@@ -94,7 +108,7 @@ def train_paired(train, validation, bits, seed, objective, temperature, epochs, 
         with torch.no_grad():
             for start in range(0, len(validation), batch_size):
                 batch = torch.from_numpy(validation[start:start + batch_size]).to(device)
-                base, _ = paired_objective(model, batch, validation_rng, objective, temperature)
+                base, _, _ = paired_objective(model, batch, validation_rng, objective, temperature)
                 total += base.item() * len(batch)
         value = total / len(validation)
         history.append(value)
@@ -109,7 +123,8 @@ def train_paired(train, validation, bits, seed, objective, temperature, epochs, 
 def fit_paired_artifact(train, validation, bits, seed, objective, temperature, config, device, directory):
     start = time.perf_counter()
     model, history = train_paired(train, validation, bits, seed, objective, temperature,
-                                  config["epochs"], config["batch_size"], device)
+                                  config["epochs"], config["batch_size"], device,
+                                  decorrelation_weight=config.get("decorrelation_weight", 0.0))
     head = None
     if objective == "contrastive_projection":
         head = model.projection_head
@@ -128,6 +143,7 @@ def fit_paired_artifact(train, validation, bits, seed, objective, temperature, c
     np.testing.assert_allclose(restored, expected, rtol=1e-5, atol=1e-5)
     np.testing.assert_array_equal(restored > saved["binary_thresholds"], expected > thresholds)
     return {"fit_seconds": fit_seconds, "validation_objective_by_epoch": history,
+            "decorrelation_weight": config.get("decorrelation_weight", 0.0),
             "projection_head": [bits, 128, 128] if head is not None else None,
             "training_only_parameter_bytes": sum(p.numel() * p.element_size() for p in head.parameters()) if head is not None else 0,
             "best_validation_objective": min(history), "artifact_roundtrip": "passed",
@@ -197,14 +213,30 @@ def diagnose_selected(args):
         raise ValueError("Diagnostic seed must belong to the frozen experiment's seed list")
     use_projection = getattr(args, "projection_head", False)
     objective = "contrastive_projection" if use_projection else "contrastive"
-    train_new_encoder = seed != config["tuning_seed"] or use_projection
+    weight = getattr(args, "decorrelation_weight", 0.0)
+    weights = {str(bits): weight for bits in config["bits"]}
+    weight_path = getattr(args, "decorrelation_from", None)
+    if weight_path is not None:
+        if weight != 0:
+            raise ValueError("Use either a scalar decorrelation weight or a selected-weight report")
+        weight_report = json.loads(weight_path.read_text())
+        if (weight_report["source_tuning_sha256"] != hashlib.sha256(tuning_bytes).hexdigest()
+                or weight_report["versions"] != versions
+                or weight_report["selection_metric"] != "itq_binary.validation_precision_at_10"):
+            raise ValueError("Decorrelation weights do not match the frozen tuning source and selection rule")
+        weights = {str(bits): weight_report["selected_weights"][str(bits)] for bits in config["bits"]}
+    if any(not np.isfinite(value) or value < 0 for value in weights.values()):
+        raise ValueError("Decorrelation weights must be finite and nonnegative")
+    if use_projection and any(weights.values()):
+        raise ValueError("Keep projection-head and decorrelation ablations separate")
+    train_new_encoder = seed != config["tuning_seed"] or use_projection or any(weights.values())
     if train_new_encoder and config["quantization_weight"] != QUANTIZATION_WEIGHT:
         raise ValueError("Quantization weight differs from the frozen training recipe")
     selected = [next(r for r in tuning["results"] if r["bits"] == bits
                      and r["temperature"] == tuning["selected_temperatures"][str(bits)]) for bits in config["bits"]]
-    source_paths = [tuning_path]
-    if not train_new_encoder:
-        for result in selected:
+    source_paths = [tuning_path] + ([weight_path] if weight_path is not None else [])
+    for result in selected:
+        if seed == config["tuning_seed"] and not use_projection and weights[str(result["bits"])] == 0:
             source_paths.extend(Path(result["artifact_dir"]) / name for name in ["transform.npz", "autoencoder.pt"])
     if args.reference_itq_from is not None:
         reference_path = args.reference_itq_from / "protocol.json"
@@ -223,6 +255,7 @@ def diagnose_selected(args):
                            "itq_iterations": 50, "encoders_retrained": train_new_encoder, "device": args.device,
                            "training_objective": objective, "projection_head": use_projection,
                            "projection_head_width": 128 if use_projection else None,
+                           "decorrelation_weights": weights, "decorrelation_variance_floor": DECORRELATION_VARIANCE_FLOOR,
                            "data_dir": str(args.data_dir), "smoke": config["smoke"]},
                 "source_training_config": config,
                 "selected_temperatures": tuning["selected_temperatures"], "versions": versions,
@@ -238,10 +271,12 @@ def diagnose_selected(args):
         print(f"Diagnosing contrastive KMNIST validation, {bits} bits", flush=True)
         source = Path(original["artifact_dir"])
         encoder_fit = None
+        weight = weights[str(bits)]
+        train_new_encoder = seed != config["tuning_seed"] or use_projection or weight > 0
         if train_new_encoder:
             source = args.output_dir / "encoders" / f"{objective}-{bits}"
             encoder_fit = fit_paired_artifact(train, validation, bits, seed, objective, original["temperature"],
-                                              config, args.device, source)
+                                              {**config, "decorrelation_weight": weight}, args.device, source)
             files = ["transform.npz", "autoencoder.pt"] + (["projection_head.pt"] if use_projection else [])
             for name in files:
                 path = source / name
@@ -266,6 +301,9 @@ def diagnose_selected(args):
             reference_metrics["validation_precision_at_10"] = reference_metrics.pop("same_class_precision_at_10")
             metrics["pca_itq_reference"] = reference_metrics
         results.append({"bits": bits, "temperature": original["temperature"], "retrieval": metrics,
+                        "decorrelation_weight": weight,
+                        "raw_training_decorrelation_penalty": decorrelation_penalty(torch.from_numpy(latent)).item(),
+                        "minimum_raw_training_variance": float(latent.var(axis=0).min()),
                         "source_artifact_dir": str(source), "artifact_dir": str(directory),
                         "median_score_matches_tuning": None if train_new_encoder else True,
                         "encoder_fit": encoder_fit, **extra})
@@ -278,6 +316,48 @@ def diagnose_selected(args):
                  "source_files_unchanged": True, "results": results, "elapsed_seconds": time.perf_counter() - start})
 
 
+def select_decorrelation_weights(results, bits):
+    return {str(b): max((r for r in results if r["bits"] == b),
+                       key=lambda r: (r["validation_precision_at_10"], -r["decorrelation_weight"]))["decorrelation_weight"]
+            for b in bits}
+
+
+def tune_decorrelation(args):
+    if args.output_dir.exists():
+        raise ValueError("Tuning output directory exists; choose a fresh path")
+    source_path = args.diagnose_from / "tuning.json"
+    source_bytes = source_path.read_bytes()
+    source = json.loads(source_bytes)
+    weights = [0.0, 0.001, 0.01, 0.1]
+    protocol = {"dataset": "kmnist", "query_split": "validation", "seed": source["config"]["tuning_seed"],
+                "bits": source["config"]["bits"], "weights": weights,
+                "selection_metric": "itq_binary.validation_precision_at_10", "projection_head": False,
+                "variance_floor": DECORRELATION_VARIANCE_FLOOR, "itq_iterations": 50,
+                "source_tuning": str(source_path), "source_tuning_sha256": hashlib.sha256(source_bytes).hexdigest(),
+                "source_training_config": source["config"], "selected_temperatures": source["selected_temperatures"],
+                "versions": source["versions"]}
+    save_report(args.output_dir / "protocol.json", protocol)
+    start = time.perf_counter()
+    results = []
+    for weight in weights:
+        directory = args.output_dir / f"weight-{weight:g}"
+        candidate = SimpleNamespace(**{**vars(args), "output_dir": directory, "decorrelation_weight": weight,
+                                        "decorrelation_from": None, "diagnostic_seed": None})
+        print(f"Tuning decorrelation weight={weight}", flush=True)
+        diagnose_selected(candidate)
+        report_path = directory / "diagnostics.json"
+        report_bytes = report_path.read_bytes()
+        report = json.loads(report_bytes)
+        for result in report["results"]:
+            results.append({**result, "validation_precision_at_10": result["retrieval"]["itq_binary"]["validation_precision_at_10"],
+                            "candidate_report": str(report_path), "candidate_report_sha256": hashlib.sha256(report_bytes).hexdigest()})
+    selected = select_decorrelation_weights(results, protocol["bits"])
+    save_report(args.output_dir / "tuning.json",
+                {**protocol, "selected_weights": selected, "results": results,
+                 "elapsed_seconds": time.perf_counter() - start})
+    print(f"Frozen decorrelation weights: {selected}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=["all", "tune", "evaluate"], default="all")
@@ -288,15 +368,24 @@ def main():
     parser.add_argument("--diagnose-from", type=Path, help="Diagnose selected KMNIST encoders with frozen settings")
     parser.add_argument("--diagnostic-seed", type=int, help="Replicate a frozen source seed; fit its encoder if not the tuning seed")
     parser.add_argument("--projection-head", action="store_true", help="Diagnostic ablation: train with a bits/128/128 head, then discard it")
+    parser.add_argument("--tune-decorrelation", action="store_true", help="Select a small decorrelation weight by validation ITQ retrieval")
+    parser.add_argument("--decorrelation-weight", type=float, default=0.0, help="Fixed diagnostic decorrelation weight")
+    parser.add_argument("--decorrelation-from", type=Path, help="Frozen per-bit decorrelation tuning report")
     parser.add_argument("--reference-itq-from", type=Path, help="Saved KMNIST PCA ITQ benchmark for the diagnostic")
     args = parser.parse_args()
     if args.diagnose_from is not None:
         if args.stage != "all" or args.smoke:
             parser.error("Diagnostic mode uses the source report's settings, not --stage or --smoke")
-        diagnose_selected(args)
+        if args.tune_decorrelation:
+            if args.projection_head or args.decorrelation_from is not None or args.decorrelation_weight != 0 or args.diagnostic_seed is not None:
+                parser.error("Decorrelation tuning uses the source seed and fixed weight grid without a projection head")
+            tune_decorrelation(args)
+        else:
+            diagnose_selected(args)
         return
-    if args.reference_itq_from is not None or args.diagnostic_seed is not None or args.projection_head:
-        parser.error("--reference-itq-from, --diagnostic-seed and --projection-head require --diagnose-from")
+    if (args.reference_itq_from is not None or args.diagnostic_seed is not None or args.projection_head
+            or args.tune_decorrelation or args.decorrelation_from is not None or args.decorrelation_weight != 0):
+        parser.error("Diagnostic ablation options require --diagnose-from")
     config = {"bits": [16, 32, 64], "seeds": [42, 7, 21, 84, 123], "epochs": 20, "batch_size": 256,
               "train_size": 50000, "validation_size": 10000, "tuning_queries": 2000, "query_pool_size": 10000,
               "temperatures": [0.1, 0.2, 0.5], "quantization_weight": QUANTIZATION_WEIGHT,
