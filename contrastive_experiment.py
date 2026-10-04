@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from benchmark_transfer import (evaluate_saved_databases, fit_itq_artifact, measure_cpu_encoding,
                                 saved_codes, unseen_partitions)
-from diagnose_quantization import continuous_neighbors, load_artifact, save_artifact
+from diagnose_quantization import continuous_neighbors, fit_itq, load_artifact, save_artifact
 from experiment import Autoencoder, encode, evaluate, load_data, quantization_penalty
 from penalty_experiment import save_report
 
@@ -358,6 +358,136 @@ def tune_decorrelation(args):
     print(f"Frozen decorrelation weights: {selected}", flush=True)
 
 
+def fit_feature_hash(features, encoder_directory, directory, bits, seed):
+    start = time.perf_counter()
+    pca = PCA(n_components=bits, svd_solver="randomized", random_state=seed).fit(features)
+    pca.components_ = np.ascontiguousarray(pca.components_)
+    projected = pca.transform(features)
+    mean, rotation, history = fit_itq(projected, iterations=50, seed=seed)
+    fit_seconds = time.perf_counter() - start
+    arrays = {"method": "encoder_pca", "encoder_width": features.shape[1],
+              "components": pca.components_, "input_mean": pca.mean_, "latent_mean": mean,
+              "rotation": rotation, "binary_thresholds": np.zeros(bits),
+              "median_thresholds": np.median(projected, axis=0), "hash_rule": "itq_centered_zero"}
+    directory.mkdir(parents=True, exist_ok=False)
+    checkpoint = (encoder_directory / "autoencoder.pt").read_bytes()
+    with (directory / "autoencoder.pt").open("xb") as output:
+        output.write(checkpoint)
+    with (directory / "transform.npz").open("xb") as output:
+        np.savez(output, **arrays)
+    state = torch.load(directory / "autoencoder.pt", map_location="cpu", weights_only=True)
+    encoder_bytes = sum(value.numel() * value.element_size() for name, value in state.items() if name.startswith("encoder."))
+    return {"compression_fit_seconds": fit_seconds, "itq_quantization_mse_by_iteration": history,
+            "inference_parameter_bytes": encoder_bytes + sum(arrays[key].nbytes for key in
+                ["components", "input_mean", "latent_mean", "rotation", "binary_thresholds"])}, arrays
+
+
+def wide_screen_passes(results):
+    scores = [r["retrieval"] for r in results]
+    return (all(r["wide_pca_itq"]["validation_precision_at_10"] > r["direct_itq"]["validation_precision_at_10"] for r in scores)
+            and sum(r["wide_pca_itq"]["validation_precision_at_10"] > r["pixel_pca_itq"]["validation_precision_at_10"] for r in scores) >= 2)
+
+
+def diagnose_wide_features(args):
+    if args.output_dir.exists():
+        raise ValueError("Output directory exists; choose a fresh path")
+    tuning_path = args.diagnose_from / "tuning.json"
+    source = json.loads(tuning_path.read_text())
+    config = source["config"]
+    versions = {"numpy": np.__version__, "torch": torch.__version__,
+                "torchvision": torchvision.__version__, "sklearn": sklearn.__version__}
+    seed = config["tuning_seed"] if args.diagnostic_seed is None else args.diagnostic_seed
+    if config["tuning_dataset"] != "kmnist" or config["quantization_weight"] != QUANTIZATION_WEIGHT:
+        raise ValueError("Wide-feature study requires the frozen KMNIST contrastive recipe")
+    if versions != source["versions"] or seed not in config["seeds"]:
+        raise ValueError("Versions or seed differ from the frozen source")
+    direct_path = args.direct_itq_from / "diagnostics.json"
+    direct_report = json.loads(direct_path.read_text())
+    pixel_path = args.reference_itq_from / "protocol.json"
+    pixel_report = json.loads(pixel_path.read_text())
+    if (direct_report["config"]["dataset"] != "kmnist" or direct_report["config"]["seed"] != seed
+            or direct_report["config"]["train_size"] != config["train_size"]
+            or direct_report["config"]["query_size"] != config["tuning_queries"]
+            or direct_report["config"].get("projection_head", False)
+            or any(direct_report["config"].get("decorrelation_weights", {}).values())
+            or direct_report["config"]["query_split"] != "validation"
+            or direct_report["selected_temperatures"] != source["selected_temperatures"]
+            or direct_report["versions"] != versions or pixel_report["versions"] != versions
+            or pixel_report["config"]["dataset"] != "kmnist"
+            or pixel_report["source_config"]["train_size"] != config["train_size"]):
+        raise ValueError("Reference models must match the KMNIST training/validation protocol")
+    references = {}
+    paths = [tuning_path, direct_path, pixel_path]
+    for bits in config["bits"]:
+        direct = next(r for r in direct_report["results"] if r["bits"] == bits)
+        directories = {"direct_itq": Path(direct["artifact_dir"]),
+                       "pixel_pca_itq": args.reference_itq_from / "models" / f"seed-{seed}" / f"pca_itq-{bits}"}
+        references[bits] = directories
+        for name, directory in directories.items():
+            paths.append(directory / "transform.npz")
+            if name == "direct_itq":
+                paths.append(directory / "autoencoder.pt")
+    hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+    protocol = {"config": {"dataset": "kmnist", "query_split": "validation", "seed": seed,
+                           "encoder_width": 128, "temperature": 0.2, "bits": config["bits"],
+                           "train_size": config["train_size"], "validation_size": config["validation_size"],
+                           "query_size": config["tuning_queries"], "projection_head": False,
+                           "decorrelation_weight": 0.0, "quantization_weight": QUANTIZATION_WEIGHT,
+                           "itq_iterations": 50, "data_dir": str(args.data_dir), "device": args.device,
+                           "advance_rule": "beat direct ITQ at all widths and pixel PCA ITQ at least two"},
+                "source_training_config": config, "source_sha256": hashes, "versions": versions}
+    save_report(args.output_dir / "protocol.json", protocol)
+    start = time.perf_counter()
+    train, validation, queries, labels, query_labels, ids = load_data(
+        args.data_dir, seed, config["train_size"], config["validation_size"], config["tuning_queries"],
+        dataset="kmnist", query_split="validation", return_ids=True)
+    if {name: values.tolist() for name, values in ids.items()} != direct_report["partitions"]:
+        raise ValueError("Reference split IDs differ from the new comparison")
+    encoder_directory = args.output_dir / "encoder-128"
+    encoder_fit = fit_paired_artifact(train, validation, 128, seed, "contrastive", 0.2,
+                                      {**config, "decorrelation_weight": 0.0}, args.device, encoder_directory)
+    transform, _ = load_artifact(encoder_directory, args.device)
+    train_features, query_features = transform(train), transform(queries)
+    continuous = {}
+    for metric in ["euclidean", "cosine"]:
+        neighbors = continuous_neighbors(train_features, query_features, metric)
+        continuous[metric] = float((labels[neighbors] == query_labels[:, None]).mean())
+    encoder_digest = hashlib.sha256((encoder_directory / "autoencoder.pt").read_bytes()).hexdigest()
+    results = []
+    for bits in config["bits"]:
+        directory = args.output_dir / "models" / f"wide_pca_itq-{bits}"
+        extra, arrays = fit_feature_hash(train_features, encoder_directory, directory, bits, seed)
+        restored, saved = load_artifact(directory, args.device)
+        offset = arrays["input_mean"].reshape(1, -1) @ arrays["components"].T
+        expected = query_features @ arrays["components"].T - offset
+        np.testing.assert_array_equal(saved_codes(restored, saved, queries, itq=True),
+                                      (expected - arrays["latent_mean"]) @ arrays["rotation"] > 0)
+        retrieval, costs = {}, {}
+        for name, model_directory in {"wide_pca_itq": directory, **references[bits]}.items():
+            project, parameters = load_artifact(model_directory, args.device)
+            metrics = evaluate(saved_codes(project, parameters, train, itq=True),
+                               saved_codes(project, parameters, queries, itq=True), labels, query_labels, 10)
+            metrics["validation_precision_at_10"] = metrics.pop("same_class_precision_at_10")
+            retrieval[name] = metrics
+            costs[name] = measure_cpu_encoding(model_directory, queries, itq=True)
+        old = next(r for r in direct_report["results"] if r["bits"] == bits)["retrieval"]
+        assert retrieval["direct_itq"]["validation_precision_at_10"] == old["itq_binary"]["validation_precision_at_10"]
+        assert retrieval["pixel_pca_itq"]["validation_precision_at_10"] == old["pca_itq_reference"]["validation_precision_at_10"]
+        assert hashlib.sha256((directory / "autoencoder.pt").read_bytes()).hexdigest() == encoder_digest
+        results.append({"bits": bits, "retrieval": retrieval, "costs": costs, "artifact_dir": str(directory),
+                        "artifact_roundtrip": "passed", **extra})
+        print(f"Wide features {bits} bits: " + ", ".join(f"{k}={v['validation_precision_at_10']:.5f}" for k, v in retrieval.items()), flush=True)
+    for path, digest in hashes.items():
+        if hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest:
+            raise RuntimeError(f"Reference changed during comparison: {path}")
+    save_report(args.output_dir / "diagnostics.json",
+                {**protocol, "encoder_fit": encoder_fit, "encoder_sha256": encoder_digest,
+                 "continuous_128_precision_at_10": continuous, "results": results,
+                 "partitions": {name: values.tolist() for name, values in ids.items()},
+                 "source_files_unchanged": True, "advance_to_multiseed": wide_screen_passes(results),
+                 "elapsed_seconds": time.perf_counter() - start})
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stage", choices=["all", "tune", "evaluate"], default="all")
@@ -371,12 +501,21 @@ def main():
     parser.add_argument("--tune-decorrelation", action="store_true", help="Select a small decorrelation weight by validation ITQ retrieval")
     parser.add_argument("--decorrelation-weight", type=float, default=0.0, help="Fixed diagnostic decorrelation weight")
     parser.add_argument("--decorrelation-from", type=Path, help="Frozen per-bit decorrelation tuning report")
+    parser.add_argument("--wide-features", action="store_true", help="Train one 128D encoder, then fit PCA and ITQ at each hash width")
+    parser.add_argument("--direct-itq-from", type=Path, help="Matching headless contrastive ITQ diagnostic directory")
     parser.add_argument("--reference-itq-from", type=Path, help="Saved KMNIST PCA ITQ benchmark for the diagnostic")
     args = parser.parse_args()
+    if args.direct_itq_from is not None and not args.wide_features:
+        parser.error("--direct-itq-from requires --wide-features")
     if args.diagnose_from is not None:
         if args.stage != "all" or args.smoke:
             parser.error("Diagnostic mode uses the source report's settings, not --stage or --smoke")
-        if args.tune_decorrelation:
+        if args.wide_features:
+            if (args.projection_head or args.tune_decorrelation or args.decorrelation_from is not None
+                    or args.decorrelation_weight != 0 or args.direct_itq_from is None or args.reference_itq_from is None):
+                parser.error("Wide-feature mode needs both references and cannot combine other ablations")
+            diagnose_wide_features(args)
+        elif args.tune_decorrelation:
             if args.projection_head or args.decorrelation_from is not None or args.decorrelation_weight != 0 or args.diagnostic_seed is not None:
                 parser.error("Decorrelation tuning uses the source seed and fixed weight grid without a projection head")
             tune_decorrelation(args)
@@ -384,7 +523,7 @@ def main():
             diagnose_selected(args)
         return
     if (args.reference_itq_from is not None or args.diagnostic_seed is not None or args.projection_head
-            or args.tune_decorrelation or args.decorrelation_from is not None or args.decorrelation_weight != 0):
+            or args.tune_decorrelation or args.decorrelation_from is not None or args.decorrelation_weight != 0 or args.wide_features):
         parser.error("Diagnostic ablation options require --diagnose-from")
     config = {"bits": [16, 32, 64], "seeds": [42, 7, 21, 84, 123], "epochs": 20, "batch_size": 256,
               "train_size": 50000, "validation_size": 10000, "tuning_queries": 2000, "query_pool_size": 10000,

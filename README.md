@@ -458,6 +458,40 @@ Tuning took 6 minutes 26 seconds (12 candidate evaluations, nine newly fitted en
 
 `results/contrastive-decorrelation-tuning/tuning.json` retains all candidate metrics, histories, source hashes, and selected weights; full per-candidate diagnostics and checkpoints remain local below that directory. Evaluation reports are in `results/contrastive-decorrelation-seed-{42,7,21,84,123}/`. All encoder and ITQ reload checks passed; encoder copies stayed byte-identical during rotation, and validation IDs and PCA-reference scores matched the prior controls. The compact tuning and evaluation JSON reports are tracked; model files stay ignored.
 
+## Shared 128D contrastive features: single-seed screen
+
+```powershell
+.venv/Scripts/python contrastive_experiment.py --diagnose-from results/contrastive --diagnostic-seed 42 --wide-features --direct-itq-from results/contrastive-itq-validation --reference-itq-from results/kmnist-itq-costs --output-dir results/contrastive-wide-seed-42-next
+```
+
+The hypothesis was to learn richer features before choosing the hash length. One `784 -> 128 -> 128` contrastive encoder is trained once, then three PCA reductions (128 to 16/32/64 dimensions) and 50-iteration ITQ rotations are fitted only to its training features. PCA uses training-mean centering without whitening or row normalization. There is no projection head or decorrelation loss. The original 0.001 quantization term is retained on the 128D features, with the same augmentations, 20 epochs, Adam, and validation-objective checkpoint selection.
+
+Temperature is fixed at 0.2, borrowed from the existing 64-bit recipe, without a new search. The direct-code references use their earlier 0.5/0.5/0.2 temperatures, so this compares fixed pipelines rather than isolating width alone at 16/32 bits. Inference keeps the 128D encoder and applies PCA then ITQ; unlike the previous training-only head, these extra transforms are not discarded.
+
+Before running, the expansion rule was fixed: beat direct contrastive + ITQ at all three widths and pixel-PCA + ITQ at least two. This pilot uses seed 42, 50,000 KMNIST training/database images, and the same 2,000 validation queries. No MNIST or official test queries are loaded.
+
+Single-seed validation precision@10 (%):
+
+| Pipeline | 16 bits | 32 bits | 64 bits |
+|---|---:|---:|---:|
+| Direct contrastive + ITQ reference | 73.490 | 78.290 | 84.310 |
+| Shared 128D encoder + PCA + ITQ | 62.985 | 79.935 | 84.210 |
+| Pixel-PCA + ITQ reference | 72.295 | 82.435 | 88.710 |
+
+The new pipeline changed retrieval by -10.505, +1.645, and -0.100 points versus direct contrastive + ITQ, and lost to pixel-PCA + ITQ at every width. The predeclared gate failed, so no additional seeds were run. Raw 128D continuous precision was 86.605% with Euclidean distance and 87.540% with cosine; those float representations are not equal-storage binary alternatives.
+
+All encoding timings below use the same 2,000 queries, one CPU thread, two warm-ups and the median of seven repeats, including thresholding and packing but not model loading or search. These are unfused warm-batch implementations, not per-query latency or GPU comparisons; do not mix them with earlier 5,000-image timing tables.
+
+| Bits | Wide pipeline ms / 2,000 | Direct contrastive + ITQ ms / 2,000 | Pixel-PCA + ITQ ms / 2,000 | Wide inference KiB | Direct inference KiB | Pixel-PCA + ITQ KiB |
+|---|---:|---:|---:|---:|---:|---:|
+| 16 | 3.695 | 3.183 | 0.364 | 467.75 | 402.81 | 54.31 |
+| 32 | 3.690 | 3.237 | 0.627 | 482.00 | 417.13 | 109.56 |
+| 64 | 4.061 | 3.542 | 1.138 | 522.50 | 457.75 | 232.06 |
+
+The shared encoder fit/calibration took 14.40 seconds once; PCA/ITQ compression added 0.34, 0.65, and 1.39 seconds per width. The full screen took 40.49 seconds. Inference sizes exclude decoder and working memory, and include the encoder plus implemented PCA/ITQ parameters. Timing each width separately repeats the encoder work; jointly producing all widths could share features, but that workflow was not benchmarked.
+
+Reports and composed artifacts are in `results/contrastive-wide-seed-42/`. The new `encoder_pca` artifact type loads the 128D encoder before projecting to hash coordinates; `saved_codes(..., itq=True)` then applies the rotation and zero thresholds. All three composed artifacts passed query-code reload checks, all encoder copies were byte-identical, reference scores reproduced the preceding diagnostic exactly, and source hashes stayed unchanged. JSON reports are tracked; checkpoint files remain ignored. This is a negative screen for one fixed recipe on reused validation data, not a conclusion about all richer-representation approaches.
+
 ## Next decision
 
-Keep headless contrastive + ITQ without the projection head or decorrelation penalty as the neural baseline. Both additions failed to improve the chosen retrieval objective reliably. PCA + ITQ remains the stronger practical reference at 32/64 bits. Stop adding generic regularizers without a targeted hypothesis about the remaining representation or binarization gap, and do not tune on the inspected test sets.
+Do not adopt or expand this 128D preset: it failed the predeclared screen and costs more to encode. Keep the existing direct contrastive + ITQ and pixel-PCA + ITQ baselines. Further experiments need a more specific hypothesis than widening the final layer or adding generic regularizers, and must not tune against the inspected test pools.

@@ -16,7 +16,8 @@ from benchmark_transfer import (evaluate_saved_databases, fit_itq_artifact, froz
                                 measure_cpu_encoding, run_pca, saved_codes, unseen_partitions)
 from contrastive_experiment import (augment_views, contrastive_loss, decorrelation_penalty, diagnose_selected,
                                     fit_paired_artifact, latent_diagnostics, paired_objective,
-                                    select_decorrelation_weights, select_temperatures, train_paired, tune_decorrelation)
+                                    fit_feature_hash, select_decorrelation_weights, select_temperatures,
+                                    train_paired, tune_decorrelation, wide_screen_passes)
 from diagnose_quantization import continuous_neighbors, fit_itq, load_artifact, save_artifact
 from experiment import (Autoencoder, code_statistics, encode, evaluate, load_data,
                         hamming_neighbors, pair_distances, quantize, quantization_penalty, separation_penalty,
@@ -732,6 +733,42 @@ class ContrastiveTests(unittest.TestCase):
             report = json.loads((args.output_dir / "tuning.json").read_text())
             self.assertEqual(report["selected_weights"], {"4": 0.001})
             self.assertEqual(report["selection_metric"], "itq_binary.validation_precision_at_10")
+
+    def test_feature_compression_preserves_encoder_and_reloads_pipeline(self):
+        rng = np.random.default_rng(42)
+        train = rng.random((32, 784), dtype=np.float32)
+        queries = rng.random((8, 784), dtype=np.float32)
+        model = Autoencoder(8)
+        features = encode(model, train, "cpu")
+        thresholds = np.median(features, axis=0)
+        with tempfile.TemporaryDirectory() as root:
+            source, destination = Path(root) / "encoder", Path(root) / "compressed"
+            save_artifact(source, "autoencoder", model, features.mean(axis=0), thresholds, np.eye(8), thresholds)
+            result, arrays = fit_feature_hash(features, source, destination, 3, 42)
+            transform, saved = load_artifact(destination)
+            self.assertEqual(int(saved["encoder_width"]), 8)
+            self.assertEqual(saved["components"].shape, (3, 8))
+            projected = encode(model, queries, "cpu") @ arrays["components"].T - arrays["input_mean"].reshape(1, -1) @ arrays["components"].T
+            np.testing.assert_array_equal(transform(queries), projected)
+            np.testing.assert_array_equal(saved_codes(transform, saved, queries, itq=True),
+                                          (projected - arrays["latent_mean"]) @ arrays["rotation"] > 0)
+            self.assertEqual((source / "autoencoder.pt").read_bytes(), (destination / "autoencoder.pt").read_bytes())
+            self.assertEqual(len(result["itq_quantization_mse_by_iteration"]), 51)
+            expected_bytes = sum(p.numel() * p.element_size() for p in model.encoder.parameters()) + sum(arrays[key].nbytes for key in
+                ["components", "input_mean", "latent_mean", "rotation", "binary_thresholds"])
+            self.assertEqual(result["inference_parameter_bytes"], expected_bytes)
+
+    def test_wide_feature_screen_uses_predeclared_gate(self):
+        rows = [{"retrieval": {"wide_pca_itq": {"validation_precision_at_10": score},
+                               "direct_itq": {"validation_precision_at_10": 0.7},
+                               "pixel_pca_itq": {"validation_precision_at_10": 0.8}}}
+                for score in [0.81, 0.82, 0.75]]
+        self.assertTrue(wide_screen_passes(rows))
+        rows[2]["retrieval"]["wide_pca_itq"]["validation_precision_at_10"] = 0.7
+        self.assertFalse(wide_screen_passes(rows))
+        rows[2]["retrieval"]["wide_pca_itq"]["validation_precision_at_10"] = 0.75
+        rows[0]["retrieval"]["wide_pca_itq"]["validation_precision_at_10"] = 0.8
+        self.assertFalse(wide_screen_passes(rows))
 
     def test_mnist_loader_uses_requested_official_dataset(self):
         class FakeDataset:

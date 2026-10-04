@@ -75,10 +75,16 @@ def load_artifact(directory, device="cpu"):
         offset = arrays["input_mean"].reshape(1, -1) @ components.T
         transform = lambda x: x @ components.T - offset
     else:
-        model = Autoencoder(len(arrays["latent_mean"]))
+        width = int(arrays["encoder_width"]) if arrays["method"].item() == "encoder_pca" else len(arrays["latent_mean"])
+        model = Autoencoder(width)
         model.load_state_dict(torch.load(Path(directory) / "autoencoder.pt", map_location="cpu", weights_only=True))
         model.to(device)
-        transform = lambda x: encode(model, x, device)
+        if arrays["method"].item() == "encoder_pca":
+            components = arrays["components"]
+            offset = arrays["input_mean"].reshape(1, -1) @ components.T
+            transform = lambda x: encode(model, x, device) @ components.T - offset
+        else:
+            transform = lambda x: encode(model, x, device)
     return transform, arrays
 
 

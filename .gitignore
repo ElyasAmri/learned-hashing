@@ -18,5 +18,6 @@ results/*
 !results/contrastive-projection-seed-*/
 !results/contrastive-decorrelation-tuning/
 !results/contrastive-decorrelation-seed-*/
+!results/contrastive-wide-seed-*/
 results/*/*
 !results/*/*.json

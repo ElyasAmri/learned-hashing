@@ -110,6 +110,8 @@ def fit_itq_artifact(train, source_directory, directory, seed, device="cpu"):
         state = torch.load(directory / "autoencoder.pt", map_location="cpu", weights_only=True)
         base_bytes = sum(value.numel() * value.element_size() for name, value in state.items()
                          if name.startswith("encoder."))
+        if saved["method"].item() == "encoder_pca":
+            base_bytes += saved["components"].nbytes + saved["input_mean"].nbytes
     with (directory / "transform.npz").open("xb") as output:
         np.savez(output, **arrays)
     restored, restored_arrays = load_artifact(directory, device)

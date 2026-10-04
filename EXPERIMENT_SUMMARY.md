@@ -266,6 +266,24 @@ The zero-weight controls reproduced all earlier 16/32-bit scores exactly. The se
 
 Tuning took 6 minutes 26 seconds; fixed-weight evaluation took 8 minutes 14 seconds. Reports are in `results/contrastive-decorrelation-tuning/` and `results/contrastive-decorrelation-seed-{42,7,21,84,123}/`. All weights were frozen before the five-seed comparison. Reloads, source hashes, unchanged encoder copies through ITQ, identical inference sizes, and matched validation IDs/PCA scores were checked. Inference speed was not remeasured, and these are reused development data rather than fresh test estimates.
 
+## 6f. Shared 128D contrastive features: pilot did not advance
+
+One `784 -> 128 -> 128` encoder was trained on KMNIST at seed 42 with temperature fixed at 0.2, the existing 0.001 quantization penalty, and the same 20-epoch recipe. No projection head or decorrelation loss was added. PCA reduced its training features to 16/32/64 dimensions before fitting 50-iteration ITQ rotations. The single encoder is retained at inference and shared by all three code lengths.
+
+The screen used 50,000 training/database images and the same 2,000 validation queries. Before running, advancement required beating direct contrastive + ITQ at all widths and pixel-PCA + ITQ at least two. No test queries were used.
+
+| Single-seed validation precision@10 (%) | 16 bits | 32 bits | 64 bits |
+|---|---:|---:|---:|
+| Direct contrastive + ITQ reference | 73.490 | 78.290 | 84.310 |
+| Shared 128D encoder + PCA + ITQ | 62.985 | 79.935 | 84.210 |
+| Pixel-PCA + ITQ reference | 72.295 | 82.435 | 88.710 |
+
+Only the 32-bit result improved over direct contrastive + ITQ; none beat pixel-PCA + ITQ. The gate failed, so no five-seed expansion was run. Raw 128D continuous retrieval was 86.605% Euclidean and 87.540% cosine, using float storage rather than binary codes. Direct 16/32-bit references used temperature 0.5, so the comparison is between fixed recipes, not width alone.
+
+The new pipeline used 467.75/482.00/522.50 KiB of inference parameters versus 402.81/417.13/457.75 KiB for direct contrastive + ITQ. Single-thread CPU encoding/packing of the same 2,000 images took 3.695/3.690/4.061 ms versus 3.183/3.237/3.542 ms for direct contrastive + ITQ and 0.364/0.627/1.138 ms for pixel-PCA + ITQ. These are warmed, unfused batch timings, not the earlier 5,000-image measurements. Jointly sharing the encoder computation across code lengths was not benchmarked.
+
+The pilot took 40.49 seconds, including one 14.40-second encoder fit/calibration and three compression fits. Reports and composed models are in `results/contrastive-wide-seed-42/`. All reference scores, source hashes, identical encoder copies, and composed query-code reloads checked out. This preset was not adopted; it does not rule out other richer-feature approaches.
+
 ## 7. Every tuning configuration
 
 All tables in this section use seed 42, 2,000 validation queries, and a 50,000-image training database. These are selection scores, not the five-seed evaluation results above. Bold scores identify the selected configuration per bit length and penalty family.
@@ -371,6 +389,7 @@ PCA/ITQ fit on CPU; neural training used CUDA. Fits include validation where app
 9. Adding ITQ to contrastive encoders improved all three widths in every development seed, but did not close the higher-bit gap to PCA + ITQ; the 16-bit aggregate was only a near tie.
 10. A fixed training-only projection head substantially worsened raw-encoder retrieval, with and without ITQ, despite leaving inference size unchanged. It was not adopted.
 11. A decorrelation sweep selected the unmodified control at 16/32 bits, and the selected 64-bit penalty failed to improve the five-seed mean. Lower correlation alone did not establish better retrieval.
+12. A shared 128D encoder followed by PCA + ITQ improved only the 32-bit direct-neural result in a single-seed pilot, lost to pixel-PCA + ITQ everywhere, and failed its predeclared expansion gate.
 
 Development queries were reused extensively and baseline tuning budgets were not identical. MNIST was held for the frozen contrastive comparison, but is now inspected too. No state-of-the-art or universal superiority claim is supported, and these test pools should not be used for more tuning.
 
@@ -379,5 +398,5 @@ Development queries were reused extensively and baseline tuning budgets were not
 - The first Fashion-MNIST ITQ run stopped on one PCA bit changing after reload because memory layout affected rounding near a threshold. Canonical contiguous components fixed it; the full rerun supplied the reported results.
 - The first KMNIST download failed TLS validation. Official archives were downloaded through certificate-checked Windows HTTPS and matched to torchvision's digests; certificate checks were not disabled.
 - Smoke tests checked execution paths, not model quality. Smoke and interrupted-run reports are excluded from the published result bundle.
-- The latest experiment development test run had 48 passing unit tests, plus compilation and dependency checks.
+- The latest experiment development test run had 50 passing unit tests, plus compilation and dependency checks.
 - Public JSON reports retain configurations, per-seed metrics, tuning candidates, split IDs where recorded, validation histories, timing samples, and provenance hashes. Artifact paths refer to local checkpoints that must be regenerated; their presence in JSON does not mean checkpoints are published.
