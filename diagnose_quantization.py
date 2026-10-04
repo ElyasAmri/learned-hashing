@@ -61,6 +61,7 @@ def save_artifact(directory, method, model, mean, thresholds, rotation, binary_t
     if method == "pca":
         arrays.update({"input_mean": model.mean_, "components": model.components_})
     else:
+        arrays["encoder_kind"] = model.encoder_kind
         with (directory / "autoencoder.pt").open("xb") as output:
             torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, output)
     with (directory / "transform.npz").open("xb") as output:
@@ -76,7 +77,8 @@ def load_artifact(directory, device="cpu"):
         transform = lambda x: x @ components.T - offset
     else:
         width = int(arrays["encoder_width"]) if arrays["method"].item() == "encoder_pca" else len(arrays["latent_mean"])
-        model = Autoencoder(width)
+        encoder_kind = arrays["encoder_kind"].item() if "encoder_kind" in arrays else "mlp"
+        model = Autoencoder(width, encoder_kind=encoder_kind)
         model.load_state_dict(torch.load(Path(directory) / "autoencoder.pt", map_location="cpu", weights_only=True))
         model.to(device)
         if arrays["method"].item() == "encoder_pca":

@@ -14,7 +14,7 @@ from sklearn.decomposition import PCA
 
 from benchmark_transfer import (evaluate_saved_databases, fit_itq_artifact, frozen_settings,
                                 measure_cpu_encoding, run_pca, saved_codes, unseen_partitions)
-from contrastive_experiment import (augment_views, contrastive_loss, decorrelation_penalty, diagnose_selected,
+from contrastive_experiment import (augment_views, cnn_screen_passes, contrastive_loss, decorrelation_penalty, diagnose_selected,
                                     fit_paired_artifact, latent_diagnostics, paired_objective,
                                     fit_feature_hash, select_decorrelation_weights, select_temperatures,
                                     train_paired, tune_decorrelation, wide_screen_passes)
@@ -769,6 +769,57 @@ class ContrastiveTests(unittest.TestCase):
         rows[2]["retrieval"]["wide_pca_itq"]["validation_precision_at_10"] = 0.75
         rows[0]["retrieval"]["wide_pca_itq"]["validation_precision_at_10"] = 0.8
         self.assertFalse(wide_screen_passes(rows))
+
+    def test_small_cnn_shapes_and_parameter_budget(self):
+        for bits, expected in [(16, 29904), (32, 55008), (64, 105216)]:
+            cnn = Autoencoder(bits, encoder_kind="small_cnn")
+            mlp = Autoencoder(bits)
+            images = torch.rand(2, 784)
+            self.assertEqual(cnn.encoder(images).shape, (2, bits))
+            self.assertEqual(cnn(images).shape, (2, 784))
+            self.assertEqual(sum(p.numel() for p in cnn.encoder.parameters()), expected)
+            self.assertLessEqual(expected, sum(p.numel() for p in mlp.encoder.parameters()))
+
+    def test_cnn_training_and_artifact_pipeline(self):
+        rng = np.random.default_rng(42)
+        train = rng.random((16, 784), dtype=np.float32)
+        validation = rng.random((8, 784), dtype=np.float32)
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root) / "cnn"
+            result = fit_paired_artifact(train, validation, 4, 42, "contrastive", 0.2,
+                                        {"epochs": 1, "batch_size": 8, "encoder_kind": "small_cnn"}, "cpu", directory)
+            self.assertEqual(result["encoder_kind"], "small_cnn")
+            self.assertEqual(result["artifact_roundtrip"], "passed")
+            self.assertTrue(np.isfinite(result["validation_objective_by_epoch"]).all())
+            transform, arrays = load_artifact(directory)
+            self.assertEqual(arrays["encoder_kind"].item(), "small_cnn")
+            latent = transform(train)
+            rotated_dir = Path(root) / "rotated"
+            rotated_result = fit_itq_artifact(train, directory, rotated_dir, 42)
+            restored, rotated = load_artifact(rotated_dir)
+            self.assertEqual(rotated_result["artifact_roundtrip"], "passed")
+            np.testing.assert_array_equal(saved_codes(restored, rotated, validation, itq=True),
+                                          (transform(validation) - rotated["latent_mean"]) @ rotated["rotation"] > 0)
+            self.assertEqual((directory / "autoencoder.pt").read_bytes(), (rotated_dir / "autoencoder.pt").read_bytes())
+            compressed_dir = Path(root) / "compressed"
+            _, compressed = fit_feature_hash(latent, directory, compressed_dir, 2, 42)
+            projected, metadata = load_artifact(compressed_dir)
+            self.assertEqual(metadata["encoder_kind"].item(), "small_cnn")
+            expected = transform(validation) @ compressed["components"].T - compressed["input_mean"].reshape(1, -1) @ compressed["components"].T
+            np.testing.assert_array_equal(projected(validation), expected)
+
+    def test_cnn_screen_requires_meaningful_gain_at_all_widths(self):
+        rows = [{"bits": bits, "retrieval": {"itq_binary": {"validation_precision_at_10": score},
+                                             "mlp_itq_reference": {"validation_precision_at_10": 0.7},
+                                             "pca_itq_reference": {"validation_precision_at_10": 0.8}}}
+                for bits, score in [(16, 0.81), (32, 0.82), (64, 0.72)]]
+        self.assertTrue(cnn_screen_passes(rows))
+        self.assertFalse(cnn_screen_passes(rows[:2]))
+        rows[2]["retrieval"]["itq_binary"]["validation_precision_at_10"] = 0.705
+        self.assertFalse(cnn_screen_passes(rows))
+        rows[2]["retrieval"]["itq_binary"]["validation_precision_at_10"] = 0.72
+        rows[0]["retrieval"]["itq_binary"]["validation_precision_at_10"] = 0.805
+        self.assertFalse(cnn_screen_passes(rows))
 
     def test_mnist_loader_uses_requested_official_dataset(self):
         class FakeDataset:

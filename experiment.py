@@ -18,9 +18,19 @@ POPCOUNT = np.array([i.bit_count() for i in range(256)], dtype=np.uint8)
 
 
 class Autoencoder(nn.Module):
-    def __init__(self, bits):
+    def __init__(self, bits, encoder_kind="mlp"):
         super().__init__()
-        self.encoder = nn.Sequential(nn.Linear(784, 128), nn.ReLU(), nn.Linear(128, bits))
+        self.encoder_kind = encoder_kind
+        if encoder_kind == "mlp":
+            self.encoder = nn.Sequential(nn.Linear(784, 128), nn.ReLU(), nn.Linear(128, bits))
+        elif encoder_kind == "small_cnn":
+            self.encoder = nn.Sequential(
+                nn.Unflatten(1, (1, 28, 28)),
+                nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+                nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+                nn.Flatten(), nn.Linear(32 * 7 * 7, bits))
+        else:
+            raise ValueError(f"Unknown encoder kind: {encoder_kind}")
         self.decoder = nn.Sequential(nn.Linear(bits, 128), nn.ReLU(), nn.Linear(128, 784), nn.Sigmoid())
 
     def forward(self, x):

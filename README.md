@@ -492,6 +492,64 @@ The shared encoder fit/calibration took 14.40 seconds once; PCA/ITQ compression 
 
 Reports and composed artifacts are in `results/contrastive-wide-seed-42/`. The new `encoder_pca` artifact type loads the 128D encoder before projecting to hash coordinates; `saved_codes(..., itq=True)` then applies the rotation and zero thresholds. All three composed artifacts passed query-code reload checks, all encoder copies were byte-identical, reference scores reproduced the preceding diagnostic exactly, and source hashes stayed unchanged. JSON reports are tracked; checkpoint files remain ignored. This is a negative screen for one fixed recipe on reused validation data, not a conclusion about all richer-representation approaches.
 
+## Small convolutional encoder: gated five-seed ablation
+
+```powershell
+# Seed-42 screen; expand only if the recorded quality gate passes.
+.venv/Scripts/python contrastive_experiment.py --diagnose-from results/contrastive --diagnostic-seed 42 --cnn --direct-itq-from results/contrastive-itq-validation --reference-itq-from results/kmnist-itq-costs --output-dir results/contrastive-cnn-seed-42-next
+if ($LASTEXITCODE -ne 0) { throw "CNN screen failed" }
+$screen = Get-Content results/contrastive-cnn-seed-42-next/diagnostics.json -Raw | ConvertFrom-Json
+if ($screen.advance_to_multiseed) {
+    foreach ($seed in 7,21,84,123) {
+        .venv/Scripts/python contrastive_experiment.py --diagnose-from results/contrastive --diagnostic-seed $seed --cnn --direct-itq-from "results/contrastive-itq-seed-$seed" --reference-itq-from results/kmnist-itq-costs --output-dir "results/contrastive-cnn-seed-$seed-next"
+        if ($LASTEXITCODE -ne 0) { throw "CNN replication failed for seed $seed" }
+    }
+}
+```
+
+The new encoder reshapes flat inputs to `1x28x28`, then applies `Conv(1,16,3,padding=1) -> ReLU -> MaxPool(2) -> Conv(16,32,3,padding=1) -> ReLU -> MaxPool(2) -> Flatten -> Linear(1568,bits)`. There is no batch normalization, projection head, or decorrelation loss. The decoder remains unused and frozen. Contrastive temperatures 0.5/0.5/0.2, quantization weight 0.001, augmentations, 20 epochs, batch size 256, Adam, and fixed-view validation checkpoint selection all match the MLP recipe. CNN initialization is seeded, but cannot be tensor-matched to the different MLP architecture. This is an architecture comparison with a parameter budget, not equal computation or equal depth.
+
+The predeclared screen required CNN + ITQ to gain at least one percentage point over direct MLP + ITQ at all three widths, and at least one point over pixel-PCA + ITQ at two widths. The seed-42 CNN + ITQ scores were 82.920/90.530/92.240%, passing the gate. The remaining four seeds then ran unchanged, without further selection or tuning.
+
+All five runs use the same 50,000 KMNIST training/database images and 2,000 disjoint validation queries per seed as their references. The encoder stays frozen during 50-iteration ITQ fitting. No MNIST or official test queries are loaded. Validation precision@10 (%), mean +/- sample standard deviation across five seeds:
+
+| Representation | 16 dimensions/bits | 32 dimensions/bits | 64 dimensions/bits |
+|---|---:|---:|---:|
+| CNN continuous Euclidean | 93.54 +/- 0.41 | 94.80 +/- 0.73 | 94.64 +/- 0.51 |
+| CNN continuous cosine | 93.97 +/- 0.48 | 95.24 +/- 0.70 | 95.46 +/- 0.41 |
+| CNN centered continuous cosine | 93.95 +/- 0.51 | 95.21 +/- 0.67 | 95.35 +/- 0.45 |
+| CNN median binary | 78.70 +/- 0.56 | 87.47 +/- 1.01 | 89.37 +/- 0.60 |
+| CNN centered sign | 79.09 +/- 0.44 | 87.39 +/- 1.08 | 89.31 +/- 0.58 |
+| CNN + ITQ binary | 83.49 +/- 0.78 | 90.52 +/- 0.78 | 92.08 +/- 0.61 |
+| MLP contrastive + ITQ reference | 72.93 +/- 1.17 | 77.66 +/- 1.20 | 84.72 +/- 0.93 |
+| Pixel-PCA + ITQ reference | 72.75 +/- 1.18 | 83.16 +/- 0.84 | 88.91 +/- 0.49 |
+
+CNN + ITQ beat both references in all 15 seed/width comparisons. Mean gains over pixel-PCA + ITQ were **10.74, 7.36, and 3.18 points**; gains over the MLP + ITQ were **10.56, 12.86, and 7.36 points**. ITQ also improved the CNN's median codes in every seed, by 4.79/3.06/2.71 points on average. The stronger continuous retrieval shows that this architecture improved the representation, not only its final orientation for binarization.
+
+### Parameter budget and encoding cost
+
+| Bits | CNN encoder parameters | MLP encoder parameters | CNN + ITQ KiB | MLP + ITQ KiB | Pixel-PCA + ITQ KiB |
+|---|---:|---:|---:|---:|---:|
+| 16 | 29,904 | 102,544 | 119.06 | 402.81 | 54.31 |
+| 32 | 55,008 | 104,608 | 223.38 | 417.13 | 109.56 |
+| 64 | 105,216 | 108,736 | 444.00 | 457.75 | 232.06 |
+
+Parameter sizes exclude the unused decoder and runtime working memory. Fewer parameters do not imply fewer operations: convolution reuses filters over spatial positions and produces larger intermediate feature maps.
+
+CPU encoding/packing time for the same 2,000 images, in milliseconds, averaged over each seed's median of seven timed repeats after two warm-ups, with one CPU thread:
+
+| Bits | CNN + ITQ | MLP + ITQ | Pixel-PCA + ITQ |
+|---|---:|---:|---:|
+| 16 | 160.752 | 3.163 | 0.459 |
+| 32 | 174.917 | 3.499 | 0.798 |
+| 64 | 154.667 | 3.647 | 1.283 |
+
+The CNN implementation was about 42 to 51 times slower than the MLP in these CPU batch measurements. These are not per-query latency, GPU-serving measurements, or an end-to-end search benchmark; model loading and search are excluded. Retrieval evaluation uses CUDA for neural encoding, while this timing comparison uses CPU. GPU encoding cost and CPU implementation optimizations remain unchecked.
+
+The seed-42 screen took 2 minutes 6 seconds; four additional seeds took 6 minutes 27 seconds, for 8 minutes 33 seconds combined. All 15 trained CNNs respected the parameter cap, passed neural and ITQ reload checks, and retained byte-identical encoder copies through rotation. Reference hashes, reference retrieval scores, and split IDs matched the earlier MLP comparisons. Encoder artifacts now record `encoder_kind`; older MLP artifacts remain loadable without that field. The CNN is opt-in via `--cnn`; the default MLP is unchanged.
+
+Reports are in `results/contrastive-cnn-seed-{42,7,21,84,123}/`. This is the strongest validation result among these tested configurations, but it remains an adaptively chosen architecture on reused development splits, not a fresh-test or state-of-the-art claim. Seed variation is not a confidence interval over independent datasets.
+
 ## Next decision
 
-Do not adopt or expand this 128D preset: it failed the predeclared screen and costs more to encode. Keep the existing direct contrastive + ITQ and pixel-PCA + ITQ baselines. Further experiments need a more specific hypothesis than widening the final layer or adding generic regularizers, and must not tune against the inspected test pools.
+Freeze the CNN recipe for fresh accuracy confirmation, and measure GPU or optimized CPU encoding before making a deployment decision. CNN + ITQ offers a clear validation-quality gain with fewer encoder parameters, but its current CPU implementation has a substantial compute cost. Keep the fast pixel-PCA + ITQ baseline; do not automatically replace it or tune against the inspected test pools.

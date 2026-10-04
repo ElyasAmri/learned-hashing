@@ -75,9 +75,9 @@ def paired_objective(model, batch, generator, objective, temperature):
 
 
 def train_paired(train, validation, bits, seed, objective, temperature, epochs, batch_size, device,
-                 decorrelation_weight=0.0):
+                 decorrelation_weight=0.0, encoder_kind="mlp"):
     torch.manual_seed(seed)
-    model = Autoencoder(bits).to(device)
+    model = Autoencoder(bits, encoder_kind=encoder_kind).to(device)
     if objective in ["contrastive", "contrastive_projection"]:
         model.decoder.requires_grad_(False)
     if objective == "contrastive_projection":
@@ -124,7 +124,8 @@ def fit_paired_artifact(train, validation, bits, seed, objective, temperature, c
     start = time.perf_counter()
     model, history = train_paired(train, validation, bits, seed, objective, temperature,
                                   config["epochs"], config["batch_size"], device,
-                                  decorrelation_weight=config.get("decorrelation_weight", 0.0))
+                                  decorrelation_weight=config.get("decorrelation_weight", 0.0),
+                                  encoder_kind=config.get("encoder_kind", "mlp"))
     head = None
     if objective == "contrastive_projection":
         head = model.projection_head
@@ -143,6 +144,8 @@ def fit_paired_artifact(train, validation, bits, seed, objective, temperature, c
     np.testing.assert_allclose(restored, expected, rtol=1e-5, atol=1e-5)
     np.testing.assert_array_equal(restored > saved["binary_thresholds"], expected > thresholds)
     return {"fit_seconds": fit_seconds, "validation_objective_by_epoch": history,
+            "encoder_kind": model.encoder_kind,
+            "encoder_parameter_count": sum(p.numel() for p in model.encoder.parameters()),
             "decorrelation_weight": config.get("decorrelation_weight", 0.0),
             "projection_head": [bits, 128, 128] if head is not None else None,
             "training_only_parameter_bytes": sum(p.numel() * p.element_size() for p in head.parameters()) if head is not None else 0,
@@ -211,6 +214,8 @@ def diagnose_selected(args):
     seed = config["tuning_seed"] if requested_seed is None else requested_seed
     if requested_seed is not None and seed not in config["seeds"]:
         raise ValueError("Diagnostic seed must belong to the frozen experiment's seed list")
+    use_cnn = getattr(args, "cnn", False)
+    encoder_kind = "small_cnn" if use_cnn else "mlp"
     use_projection = getattr(args, "projection_head", False)
     objective = "contrastive_projection" if use_projection else "contrastive"
     weight = getattr(args, "decorrelation_weight", 0.0)
@@ -229,14 +234,16 @@ def diagnose_selected(args):
         raise ValueError("Decorrelation weights must be finite and nonnegative")
     if use_projection and any(weights.values()):
         raise ValueError("Keep projection-head and decorrelation ablations separate")
-    train_new_encoder = seed != config["tuning_seed"] or use_projection or any(weights.values())
+    if use_cnn and (use_projection or any(weights.values())):
+        raise ValueError("Keep CNN, projection-head and decorrelation ablations separate")
+    train_new_encoder = seed != config["tuning_seed"] or use_projection or any(weights.values()) or use_cnn
     if train_new_encoder and config["quantization_weight"] != QUANTIZATION_WEIGHT:
         raise ValueError("Quantization weight differs from the frozen training recipe")
     selected = [next(r for r in tuning["results"] if r["bits"] == bits
                      and r["temperature"] == tuning["selected_temperatures"][str(bits)]) for bits in config["bits"]]
     source_paths = [tuning_path] + ([weight_path] if weight_path is not None else [])
     for result in selected:
-        if seed == config["tuning_seed"] and not use_projection and weights[str(result["bits"])] == 0:
+        if seed == config["tuning_seed"] and not use_projection and not use_cnn and weights[str(result["bits"])] == 0:
             source_paths.extend(Path(result["artifact_dir"]) / name for name in ["transform.npz", "autoencoder.pt"])
     if args.reference_itq_from is not None:
         reference_path = args.reference_itq_from / "protocol.json"
@@ -248,23 +255,46 @@ def diagnose_selected(args):
         source_paths.append(reference_path)
         source_paths.extend(args.reference_itq_from / "models" / f"seed-{seed}" / f"pca_itq-{bits}" / "transform.npz"
                             for bits in config["bits"])
+    direct_report = None
+    if use_cnn:
+        direct_path = args.direct_itq_from / "diagnostics.json"
+        direct_report = json.loads(direct_path.read_text())
+        direct_config = direct_report["config"]
+        if (direct_config["dataset"] != "kmnist" or direct_config["query_split"] != "validation"
+                or direct_config["seed"] != seed or direct_config["train_size"] != config["train_size"]
+                or direct_config["query_size"] != config["tuning_queries"]
+                or direct_config.get("encoder_kind", "mlp") != "mlp"
+                or direct_config.get("projection_head", False)
+                or any(direct_config.get("decorrelation_weights", {}).values())
+                or direct_report["selected_temperatures"] != tuning["selected_temperatures"]
+                or direct_report["versions"] != versions):
+            raise ValueError("CNN control must match the headless MLP validation protocol")
+        source_paths.append(direct_path)
+        for result in direct_report["results"]:
+            source_paths.extend(Path(result["artifact_dir"]) / name for name in ["transform.npz", "autoencoder.pt"])
     hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in source_paths}
     protocol = {"config": {"dataset": "kmnist", "query_split": "validation", "seed": seed,
                            "bits": config["bits"], "train_size": config["train_size"],
                            "validation_size": config["validation_size"], "query_size": config["tuning_queries"],
                            "itq_iterations": 50, "encoders_retrained": train_new_encoder, "device": args.device,
-                           "training_objective": objective, "projection_head": use_projection,
+                           "training_objective": objective, "projection_head": use_projection, "encoder_kind": encoder_kind,
                            "projection_head_width": 128 if use_projection else None,
                            "decorrelation_weights": weights, "decorrelation_variance_floor": DECORRELATION_VARIANCE_FLOOR,
                            "data_dir": str(args.data_dir), "smoke": config["smoke"]},
                 "source_training_config": config,
                 "selected_temperatures": tuning["selected_temperatures"], "versions": versions,
                 "source_sha256": hashes}
+    if use_cnn:
+        protocol["config"].update({"cnn_channels": [16, 32], "kernel_size": 3, "pool_size": 2,
+                                   "advance_rule": "gain >=1pp over MLP ITQ at all three widths and pixel PCA ITQ at least two",
+                                   "cpu_timing_threads": 1, "cpu_timing_warmups": 2, "cpu_timing_repeats": 7})
     save_report(args.output_dir / "protocol.json", protocol)
     start = time.perf_counter()
     train, validation, queries, labels, query_labels, ids = load_data(
         args.data_dir, seed, config["train_size"], config["validation_size"], config["tuning_queries"],
         query_split="validation", dataset="kmnist", return_ids=True)
+    if direct_report is not None and direct_report["partitions"] != {name: values.tolist() for name, values in ids.items()}:
+        raise ValueError("CNN and MLP control split IDs differ")
     results = []
     for original in selected:
         bits = original["bits"]
@@ -272,11 +302,11 @@ def diagnose_selected(args):
         source = Path(original["artifact_dir"])
         encoder_fit = None
         weight = weights[str(bits)]
-        train_new_encoder = seed != config["tuning_seed"] or use_projection or weight > 0
+        train_new_encoder = seed != config["tuning_seed"] or use_projection or weight > 0 or use_cnn
         if train_new_encoder:
             source = args.output_dir / "encoders" / f"{objective}-{bits}"
             encoder_fit = fit_paired_artifact(train, validation, bits, seed, objective, original["temperature"],
-                                              {**config, "decorrelation_weight": weight}, args.device, source)
+                                              {**config, "decorrelation_weight": weight, "encoder_kind": encoder_kind}, args.device, source)
             files = ["transform.npz", "autoencoder.pt"] + (["projection_head.pt"] if use_projection else [])
             for name in files:
                 path = source / name
@@ -300,6 +330,22 @@ def diagnose_selected(args):
                                          saved_codes(project, pca_arrays, queries, itq=True), labels, query_labels, 10)
             reference_metrics["validation_precision_at_10"] = reference_metrics.pop("same_class_precision_at_10")
             metrics["pca_itq_reference"] = reference_metrics
+        if use_cnn:
+            control = next(r for r in direct_report["results"] if r["bits"] == bits)
+            control_directory = Path(control["artifact_dir"])
+            control_transform, control_arrays = load_artifact(control_directory, args.device)
+            control_metrics = evaluate(saved_codes(control_transform, control_arrays, train, itq=True),
+                                       saved_codes(control_transform, control_arrays, queries, itq=True), labels, query_labels, 10)
+            control_metrics["validation_precision_at_10"] = control_metrics.pop("same_class_precision_at_10")
+            np.testing.assert_equal(control_metrics["validation_precision_at_10"], control["retrieval"]["itq_binary"]["validation_precision_at_10"])
+            np.testing.assert_equal(metrics["pca_itq_reference"]["validation_precision_at_10"], control["retrieval"]["pca_itq_reference"]["validation_precision_at_10"])
+            metrics["mlp_itq_reference"] = control_metrics
+            extra["costs"] = {name: measure_cpu_encoding(path, queries, itq=True) for name, path in
+                              [("cnn_itq", directory), ("mlp_itq", control_directory), ("pixel_pca_itq", reference_dir)]}
+            mlp_parameters = sum(p.numel() for p in Autoencoder(bits).encoder.parameters())
+            if encoder_fit["encoder_parameter_count"] > mlp_parameters:
+                raise ValueError("CNN exceeded the declared encoder parameter budget")
+            extra["mlp_encoder_parameter_count"] = mlp_parameters
         results.append({"bits": bits, "temperature": original["temperature"], "retrieval": metrics,
                         "decorrelation_weight": weight,
                         "raw_training_decorrelation_penalty": decorrelation_penalty(torch.from_numpy(latent)).item(),
@@ -311,9 +357,18 @@ def diagnose_selected(args):
     for path, expected in hashes.items():
         if hashlib.sha256(Path(path).read_bytes()).hexdigest() != expected:
             raise RuntimeError(f"Source changed during diagnosis: {path}")
+    screen = {"advance_to_multiseed": cnn_screen_passes(results)} if use_cnn else {}
     save_report(args.output_dir / "diagnostics.json",
                 {**protocol, "partitions": {name: values.tolist() for name, values in ids.items()},
-                 "source_files_unchanged": True, "results": results, "elapsed_seconds": time.perf_counter() - start})
+                 "source_files_unchanged": True, "results": results, "elapsed_seconds": time.perf_counter() - start, **screen})
+
+
+def cnn_screen_passes(results):
+    if {r["bits"] for r in results} != {16, 32, 64}:
+        return False
+    scores = [r["retrieval"] for r in results]
+    return (all(r["itq_binary"]["validation_precision_at_10"] + 1e-12 >= r["mlp_itq_reference"]["validation_precision_at_10"] + 0.01 for r in scores)
+            and sum(r["itq_binary"]["validation_precision_at_10"] + 1e-12 >= r["pca_itq_reference"]["validation_precision_at_10"] + 0.01 for r in scores) >= 2)
 
 
 def select_decorrelation_weights(results, bits):
@@ -365,7 +420,9 @@ def fit_feature_hash(features, encoder_directory, directory, bits, seed):
     projected = pca.transform(features)
     mean, rotation, history = fit_itq(projected, iterations=50, seed=seed)
     fit_seconds = time.perf_counter() - start
-    arrays = {"method": "encoder_pca", "encoder_width": features.shape[1],
+    with np.load(encoder_directory / "transform.npz", allow_pickle=False) as encoder_arrays:
+        encoder_kind = encoder_arrays["encoder_kind"].item() if "encoder_kind" in encoder_arrays else "mlp"
+    arrays = {"method": "encoder_pca", "encoder_width": features.shape[1], "encoder_kind": encoder_kind,
               "components": pca.components_, "input_mean": pca.mean_, "latent_mean": mean,
               "rotation": rotation, "binary_thresholds": np.zeros(bits),
               "median_thresholds": np.median(projected, axis=0), "hash_rule": "itq_centered_zero"}
@@ -501,16 +558,22 @@ def main():
     parser.add_argument("--tune-decorrelation", action="store_true", help="Select a small decorrelation weight by validation ITQ retrieval")
     parser.add_argument("--decorrelation-weight", type=float, default=0.0, help="Fixed diagnostic decorrelation weight")
     parser.add_argument("--decorrelation-from", type=Path, help="Frozen per-bit decorrelation tuning report")
+    parser.add_argument("--cnn", action="store_true", help="Diagnostic ablation: use a small parameter-matched convolutional encoder")
     parser.add_argument("--wide-features", action="store_true", help="Train one 128D encoder, then fit PCA and ITQ at each hash width")
     parser.add_argument("--direct-itq-from", type=Path, help="Matching headless contrastive ITQ diagnostic directory")
     parser.add_argument("--reference-itq-from", type=Path, help="Saved KMNIST PCA ITQ benchmark for the diagnostic")
     args = parser.parse_args()
-    if args.direct_itq_from is not None and not args.wide_features:
-        parser.error("--direct-itq-from requires --wide-features")
+    if args.direct_itq_from is not None and not (args.wide_features or args.cnn):
+        parser.error("--direct-itq-from requires --wide-features or --cnn")
     if args.diagnose_from is not None:
         if args.stage != "all" or args.smoke:
             parser.error("Diagnostic mode uses the source report's settings, not --stage or --smoke")
-        if args.wide_features:
+        if args.cnn:
+            if (args.wide_features or args.projection_head or args.tune_decorrelation or args.decorrelation_from is not None
+                    or args.decorrelation_weight != 0 or args.direct_itq_from is None or args.reference_itq_from is None):
+                parser.error("CNN mode needs both references and cannot combine other ablations")
+            diagnose_selected(args)
+        elif args.wide_features:
             if (args.projection_head or args.tune_decorrelation or args.decorrelation_from is not None
                     or args.decorrelation_weight != 0 or args.direct_itq_from is None or args.reference_itq_from is None):
                 parser.error("Wide-feature mode needs both references and cannot combine other ablations")
@@ -523,7 +586,7 @@ def main():
             diagnose_selected(args)
         return
     if (args.reference_itq_from is not None or args.diagnostic_seed is not None or args.projection_head
-            or args.tune_decorrelation or args.decorrelation_from is not None or args.decorrelation_weight != 0 or args.wide_features):
+            or args.tune_decorrelation or args.decorrelation_from is not None or args.decorrelation_weight != 0 or args.wide_features or args.cnn):
         parser.error("Diagnostic ablation options require --diagnose-from")
     config = {"bits": [16, 32, 64], "seeds": [42, 7, 21, 84, 123], "epochs": 20, "batch_size": 256,
               "train_size": 50000, "validation_size": 10000, "tuning_queries": 2000, "query_pool_size": 10000,

@@ -2,7 +2,7 @@
 
 ## Bottom line
 
-Reconstruction alone was not competitive enough. Weak quantization regularization improved it, but PCA + ITQ proved substantially stronger on KMNIST. Contrastive training improved over matched reconstruction and beat PCA + ITQ at 16 bits on fresh MNIST, but not at 32 or 64 bits. Neural encoding remained more expensive.
+Reconstruction alone was not competitive enough. Weak quantization regularization improved it, but PCA + ITQ proved substantially stronger on KMNIST. Contrastive training improved the MLP and beat PCA + ITQ at 16 bits on fresh MNIST, but not at 32 or 64 bits. A later small CNN delivered large KMNIST validation gains at every width with fewer encoder parameters, but CPU encoding was much slower. That latest accuracy gain still needs fresh confirmation.
 
 This file covers all completed full experiments and every tuning setting. Smoke tests and interrupted runs are not quality benchmarks. [README.md](README.md) has reproduction commands, sample standard deviations, and detailed protocol notes. Compact original JSON reports are published under [results/](results/); datasets and trained models are not included.
 
@@ -284,6 +284,31 @@ The new pipeline used 467.75/482.00/522.50 KiB of inference parameters versus 40
 
 The pilot took 40.49 seconds, including one 14.40-second encoder fit/calibration and three compression fits. Reports and composed models are in `results/contrastive-wide-seed-42/`. All reference scores, source hashes, identical encoder copies, and composed query-code reloads checked out. This preset was not adopted; it does not rule out other richer-feature approaches.
 
+## 6g. Small convolutional encoder: strong validation gain, slower CPU encoding
+
+A spatial encoder replaced the flat MLP: two 3x3 convolution/ReLU/2x2 max-pool blocks with 16 and 32 channels, followed by a linear hash layer on the 7x7x32 feature map. Temperatures 0.5/0.5/0.2, weak quantization, augmentations, training duration, checkpoint selection, and ITQ remained fixed. No projection head, decorrelation, or test queries were used.
+
+The predeclared seed-42 gate required at least one percentage point over MLP + ITQ at every width and over pixel-PCA + ITQ at two widths. CNN + ITQ scored 82.920/90.530/92.240%, passing the gate; four additional seeds then ran with unchanged settings.
+
+Five-seed mean KMNIST validation precision@10 (%) with the same 50,000 training/database images and 2,000 queries per seed:
+
+| Representation | 16 dimensions/bits | 32 dimensions/bits | 64 dimensions/bits |
+|---|---:|---:|---:|
+| CNN continuous Euclidean | 93.54 | 94.80 | 94.64 |
+| CNN continuous cosine | 93.97 | 95.24 | 95.46 |
+| CNN centered continuous cosine | 93.95 | 95.21 | 95.35 |
+| CNN median binary | 78.70 | 87.47 | 89.37 |
+| CNN centered sign | 79.09 | 87.39 | 89.31 |
+| CNN + ITQ binary | 83.49 | 90.52 | 92.08 |
+| MLP contrastive + ITQ reference | 72.93 | 77.66 | 84.72 |
+| Pixel-PCA + ITQ reference | 72.75 | 83.16 | 88.91 |
+
+CNN + ITQ beat both references in every seed and width. Gains over pixel-PCA + ITQ averaged 10.74/7.36/3.18 points, and gains over MLP + ITQ averaged 10.56/12.86/7.36 points. ITQ also improved CNN median codes in all 15 comparisons.
+
+CNN encoder parameter counts were 29,904/55,008/105,216 versus the MLP's 102,544/104,608/108,736. CNN + ITQ inference storage was 119.06/223.38/444.00 KiB, excluding decoder and working memory. However, single-thread CPU encoding/packing of the same 2,000 images took 160.752/174.917/154.667 ms versus 3.163/3.499/3.647 ms for MLP + ITQ and 0.459/0.798/1.283 ms for pixel-PCA + ITQ. These warmed batch measurements show about 42 to 51 times the MLP encoding cost; they are not GPU or per-query latency results. Fewer parameters did not mean less computation.
+
+The five runs took 8 minutes 33 seconds combined. All 15 CNNs met the parameter budget and passed model/ITQ reload checks; source/reference hashes, split IDs, and control scores matched. Reports are in `results/contrastive-cnn-seed-{42,7,21,84,123}/`. This is a strong development-data result, not fresh-test confirmation. The CNN stays opt-in pending a frozen-recipe accuracy check and deployment-oriented cost measurement.
+
 ## 7. Every tuning configuration
 
 All tables in this section use seed 42, 2,000 validation queries, and a 50,000-image training database. These are selection scores, not the five-seed evaluation results above. Bold scores identify the selected configuration per bit length and penalty family.
@@ -384,12 +409,13 @@ PCA/ITQ fit on CPU; neural training used CUDA. Fits include validation where app
 4. Useful continuous representations can lose substantial retrieval quality after binarization.
 5. Beating plain PCA did not mean beating PCA + ITQ.
 6. ITQ was dataset-dependent: it hurt PCA on Fashion-MNIST but helped strongly on KMNIST and MNIST.
-7. Contrastive training is the most promising learned configuration tried here, especially at 16 bits.
-8. PCA + ITQ remained the better accuracy/cost choice at 32/64 bits in the latest five-seed evaluation.
-9. Adding ITQ to contrastive encoders improved all three widths in every development seed, but did not close the higher-bit gap to PCA + ITQ; the 16-bit aggregate was only a near tie.
+7. Contrastive training improved the MLP over matched reconstruction, especially at 16 bits.
+8. Before the CNN trial, PCA + ITQ beat the MLP variants at 32/64 bits while being cheaper to encode.
+9. Adding ITQ to MLP contrastive encoders improved all three widths in every development seed, but did not close the higher-bit gap to PCA + ITQ; the 16-bit aggregate was only a near tie.
 10. A fixed training-only projection head substantially worsened raw-encoder retrieval, with and without ITQ, despite leaving inference size unchanged. It was not adopted.
 11. A decorrelation sweep selected the unmodified control at 16/32 bits, and the selected 64-bit penalty failed to improve the five-seed mean. Lower correlation alone did not establish better retrieval.
 12. A shared 128D encoder followed by PCA + ITQ improved only the 32-bit direct-neural result in a single-seed pilot, lost to pixel-PCA + ITQ everywhere, and failed its predeclared expansion gate.
+13. A small CNN with fewer encoder parameters passed its gate and substantially beat both MLP + ITQ and pixel-PCA + ITQ across five development seeds, but CPU encoding was about 42 to 51 times slower than the MLP. Fresh accuracy confirmation and GPU/optimized CPU timing remain necessary.
 
 Development queries were reused extensively and baseline tuning budgets were not identical. MNIST was held for the frozen contrastive comparison, but is now inspected too. No state-of-the-art or universal superiority claim is supported, and these test pools should not be used for more tuning.
 
@@ -398,5 +424,5 @@ Development queries were reused extensively and baseline tuning budgets were not
 - The first Fashion-MNIST ITQ run stopped on one PCA bit changing after reload because memory layout affected rounding near a threshold. Canonical contiguous components fixed it; the full rerun supplied the reported results.
 - The first KMNIST download failed TLS validation. Official archives were downloaded through certificate-checked Windows HTTPS and matched to torchvision's digests; certificate checks were not disabled.
 - Smoke tests checked execution paths, not model quality. Smoke and interrupted-run reports are excluded from the published result bundle.
-- The latest experiment development test run had 50 passing unit tests, plus compilation and dependency checks.
+- The latest experiment development test run had 53 passing unit tests, plus compilation and dependency checks.
 - Public JSON reports retain configurations, per-seed metrics, tuning candidates, split IDs where recorded, validation histories, timing samples, and provenance hashes. Artifact paths refer to local checkpoints that must be regenerated; their presence in JSON does not mean checkpoints are published.

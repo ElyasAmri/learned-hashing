@@ -1,0 +1,113 @@
+{
+  "config": {
+    "dataset": "kmnist",
+    "query_split": "validation",
+    "seed": 7,
+    "bits": [
+      16,
+      32,
+      64
+    ],
+    "train_size": 50000,
+    "validation_size": 10000,
+    "query_size": 2000,
+    "itq_iterations": 50,
+    "encoders_retrained": true,
+    "device": "cuda",
+    "training_objective": "contrastive",
+    "projection_head": false,
+    "encoder_kind": "small_cnn",
+    "projection_head_width": null,
+    "decorrelation_weights": {
+      "16": 0.0,
+      "32": 0.0,
+      "64": 0.0
+    },
+    "decorrelation_variance_floor": 0.0001,
+    "data_dir": "data",
+    "smoke": false,
+    "cnn_channels": [
+      16,
+      32
+    ],
+    "kernel_size": 3,
+    "pool_size": 2,
+    "advance_rule": "gain >=1pp over MLP ITQ at all three widths and pixel PCA ITQ at least two",
+    "cpu_timing_threads": 1,
+    "cpu_timing_warmups": 2,
+    "cpu_timing_repeats": 7
+  },
+  "source_training_config": {
+    "bits": [
+      16,
+      32,
+      64
+    ],
+    "seeds": [
+      42,
+      7,
+      21,
+      84,
+      123
+    ],
+    "epochs": 20,
+    "batch_size": 256,
+    "train_size": 50000,
+    "validation_size": 10000,
+    "tuning_queries": 2000,
+    "query_pool_size": 10000,
+    "temperatures": [
+      0.1,
+      0.2,
+      0.5
+    ],
+    "quantization_weight": 0.001,
+    "tuning_dataset": "kmnist",
+    "evaluation_dataset": "mnist",
+    "evaluation_query_split": "test",
+    "threshold_rule": "training_median",
+    "tuning_seed": 42,
+    "smoke": false,
+    "data_dir": "data",
+    "device": "cuda",
+    "augmentation": {
+      "rotation_degrees": 10,
+      "scale": [
+        0.9,
+        1.1
+      ],
+      "grid_translation_pixels": 2,
+      "interpolation": "bilinear",
+      "padding": "zeros",
+      "flips": false
+    },
+    "checkpoint_selection": "minimum_fixed_view_validation_base_objective",
+    "projection_head": false,
+    "itq_iterations": 50
+  },
+  "selected_temperatures": {
+    "16": 0.5,
+    "32": 0.5,
+    "64": 0.2
+  },
+  "versions": {
+    "numpy": "2.2.6",
+    "torch": "2.11.0+cu128",
+    "torchvision": "0.26.0+cu128",
+    "sklearn": "1.7.2"
+  },
+  "source_sha256": {
+    "results\\contrastive\\tuning.json": "1261edba6a0410a7d8ef495fe44cf90953ce7d1301943cd95bc96f01ad84734f",
+    "results\\kmnist-itq-costs\\protocol.json": "62b38ab1a1b71db7706e473f9f2e35073ac0b2679d76953a109f660ce04a3d6d",
+    "results\\kmnist-itq-costs\\models\\seed-7\\pca_itq-16\\transform.npz": "5b3d5eea101da29b1cbcad8913b1a4d39f3c33b6bc2d1e172049e185032764a0",
+    "results\\kmnist-itq-costs\\models\\seed-7\\pca_itq-32\\transform.npz": "5b6799a608f73f324878ee261bc7cc6818317254b120185403d65c3524056c5c",
+    "results\\kmnist-itq-costs\\models\\seed-7\\pca_itq-64\\transform.npz": "fc6d5eb2742f6bc0038cd602ff925c70c9b72b724b4e88fdc6ed57cfc99ae4f6",
+    "results\\contrastive-itq-seed-7\\diagnostics.json": "0ef7490f143fe461bd939f2970e45ca2d7c33af55e88dc4ac60c8cc3a596df75",
+    "results\\contrastive-itq-seed-7\\models\\contrastive_itq-16\\transform.npz": "0f4f96e5b55c19cd2a003445aa0b1ca39650ed5c1985759256fe4fc4e27339f8",
+    "results\\contrastive-itq-seed-7\\models\\contrastive_itq-16\\autoencoder.pt": "e5d8cc09b6d89e30d906abcb120548a2c53cd744381c86c7f1ba4e0b6a29d86b",
+    "results\\contrastive-itq-seed-7\\models\\contrastive_itq-32\\transform.npz": "a82e1d6772b6330981e149e6d9b878888895d400bab8b02986b2f25b2e2decff",
+    "results\\contrastive-itq-seed-7\\models\\contrastive_itq-32\\autoencoder.pt": "e7e9b3ce5ebcf1df84413e9e35adb8502adc410fd430be5d47acc8996026a39a",
+    "results\\contrastive-itq-seed-7\\models\\contrastive_itq-64\\transform.npz": "7530b2d6be69d51b637cb9bd8a3a147b9a8e63532d67355cde9db9171c026314",
+    "results\\contrastive-itq-seed-7\\models\\contrastive_itq-64\\autoencoder.pt": "0d3d7e56f0faeff3bc52ac27685d6068cdb1384a082084b0dccddf6c0e25d65b"
+  }
+}

@@ -19,5 +19,6 @@ results/*
 !results/contrastive-decorrelation-tuning/
 !results/contrastive-decorrelation-seed-*/
 !results/contrastive-wide-seed-*/
+!results/contrastive-cnn-seed-*/
 results/*/*
 !results/*/*.json
