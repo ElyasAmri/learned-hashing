@@ -564,6 +564,46 @@ class ContrastiveTests(unittest.TestCase):
             self.assertTrue(result["source_files_unchanged"])
             self.assertTrue(result["results"][0]["median_score_matches_tuning"])
 
+    def test_replication_uses_fixed_temperature_and_seed_without_retuning(self):
+        rng = np.random.default_rng(7)
+        train = rng.random((16, 784), dtype=np.float32)
+        validation = rng.random((8, 784), dtype=np.float32)
+        data = (train, validation, validation[:4], np.arange(16) % 2, np.arange(4) % 2,
+                {"train": np.arange(16), "validation": np.arange(50, 58), "queries": np.arange(50, 54)})
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "source"
+            source.mkdir()
+            report = {"config": {"tuning_dataset": "kmnist", "threshold_rule": "training_median",
+                                  "tuning_seed": 42, "seeds": [42, 7], "bits": [4], "train_size": 16,
+                                  "validation_size": 8, "tuning_queries": 4, "smoke": True,
+                                  "quantization_weight": 0.001, "epochs": 1, "batch_size": 8},
+                      "versions": {"numpy": np.__version__, "torch": torch.__version__,
+                                   "torchvision": torchvision.__version__, "sklearn": sklearn.__version__},
+                      "selected_temperatures": {"4": 0.2},
+                      "results": [{"bits": 4, "temperature": 0.2, "artifact_dir": "unused-seed-42-model",
+                                   "validation_precision_at_10": 0.5}]}
+            (source / "tuning.json").write_text(json.dumps(report))
+            args = SimpleNamespace(diagnose_from=source, diagnostic_seed=7, reference_itq_from=None,
+                                   device="cpu", data_dir=Path("unused"), output_dir=Path(root) / "diagnostic")
+            with patch("contrastive_experiment.load_data", return_value=data) as loader:
+                with patch("contrastive_experiment.train_paired", wraps=train_paired) as trainer:
+                    with patch("contrastive_experiment.select_temperatures", side_effect=AssertionError("Unexpected retuning")):
+                        diagnose_selected(args)
+                    trainer.assert_called_once()
+                    self.assertEqual(trainer.call_args.args[2:], (4, 7, "contrastive", 0.2, 1, 8, "cpu"))
+                loader.assert_called_once_with(args.data_dir, 7, 16, 8, 4,
+                                               query_split="validation", dataset="kmnist", return_ids=True)
+            result = json.loads((args.output_dir / "diagnostics.json").read_text())
+            self.assertTrue(result["source_files_unchanged"])
+            self.assertTrue(result["config"]["encoders_retrained"])
+            self.assertEqual(result["selected_temperatures"], {"4": 0.2})
+            self.assertIsNone(result["results"][0]["median_score_matches_tuning"])
+            self.assertEqual(len(result["results"][0]["encoder_fit"]["validation_objective_by_epoch"]), 1)
+            args.diagnostic_seed = 99
+            args.output_dir = Path(root) / "invalid-seed"
+            with self.assertRaisesRegex(ValueError, "frozen experiment's seed list"):
+                diagnose_selected(args)
+
     def test_mnist_loader_uses_requested_official_dataset(self):
         class FakeDataset:
             data = torch.arange(60000).reshape(-1, 1).expand(-1, 784)

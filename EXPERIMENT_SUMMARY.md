@@ -202,6 +202,26 @@ ITQ gained 5.575, 1.715, and 1.955 points over contrastive median codes, and als
 
 Source: [results/contrastive-itq-validation/](results/contrastive-itq-validation/).
 
+## 6c. Contrastive + ITQ five-seed development replication
+
+The four additional seeds (7, 21, 84, 123) each trained new KMNIST encoders with frozen temperatures 0.5/0.5/0.2, quantization weight 0.001, and the same augmentations, optimizer, 20 epochs, and batch size. Each encoder stayed fixed during ITQ fitting and the paired comparison. No hyperparameter search or MNIST/test evaluation was performed. Each seed used its own 50,000 training/database images and 2,000 disjoint validation queries; seed 42 reuses the preceding diagnostic.
+
+Five-seed mean validation precision@10 (%):
+
+| Representation | 16 dimensions/bits | 32 dimensions/bits | 64 dimensions/bits |
+|---|---:|---:|---:|
+| Contrastive continuous Euclidean | 82.92 | 83.05 | 87.24 |
+| Contrastive continuous cosine | 83.42 | 83.50 | 87.99 |
+| Contrastive centered continuous cosine | 83.47 | 83.55 | 87.95 |
+| Contrastive median binary | 69.34 | 76.29 | 82.37 |
+| Contrastive centered sign | 69.46 | 76.24 | 82.50 |
+| Contrastive + ITQ binary | 72.93 | 77.66 | 84.72 |
+| PCA + ITQ reference | 72.75 | 83.16 | 88.91 |
+
+ITQ improved contrastive median codes by 3.58, 1.36, and 2.35 points, winning all five seeds at every width. It also beat the centered-sign control in every comparison. The mean difference from PCA + ITQ was +0.18, -5.50, and -4.19 points, with wins in 4/5, 0/5, and 0/5 seeds. The 16-bit result is a near tie, not a robust advantage; paired-gap standard deviation was 1.16 points. These remain reused development splits, not fresh test estimates or independent datasets.
+
+The four replications took 5 minutes 48 seconds combined, fitting 12 encoders before freezing them for comparison. Reports are in `results/contrastive-itq-seed-7/`, `results/contrastive-itq-seed-21/`, `results/contrastive-itq-seed-84/`, and `results/contrastive-itq-seed-123/`, alongside the seed-42 report in `results/contrastive-itq-validation/`. Model copies remained byte-identical through rotation. Encoding cost was not remeasured.
+
 ## 7. Every tuning configuration
 
 All tables in this section use seed 42, 2,000 validation queries, and a 50,000-image training database. These are selection scores, not the five-seed evaluation results above. Bold scores identify the selected configuration per bit length and penalty family.
@@ -293,7 +313,7 @@ PCA/ITQ fit on CPU; neural training used CUDA. Fits include validation where app
 6. ITQ was dataset-dependent: it hurt PCA on Fashion-MNIST but helped strongly on KMNIST and MNIST.
 7. Contrastive training is the most promising learned configuration tried here, especially at 16 bits.
 8. PCA + ITQ remained the better accuracy/cost choice at 32/64 bits in the latest five-seed evaluation.
-9. Adding ITQ to frozen contrastive encoders improved all three widths in a single-seed validation diagnostic, but did not close the higher-bit gap to PCA + ITQ.
+9. Adding ITQ to contrastive encoders improved all three widths in every development seed, but did not close the higher-bit gap to PCA + ITQ; the 16-bit aggregate was only a near tie.
 
 Development queries were reused extensively and baseline tuning budgets were not identical. MNIST was held for the frozen contrastive comparison, but is now inspected too. No state-of-the-art or universal superiority claim is supported, and these test pools should not be used for more tuning.
 
@@ -302,5 +322,5 @@ Development queries were reused extensively and baseline tuning budgets were not
 - The first Fashion-MNIST ITQ run stopped on one PCA bit changing after reload because memory layout affected rounding near a threshold. Canonical contiguous components fixed it; the full rerun supplied the reported results.
 - The first KMNIST download failed TLS validation. Official archives were downloaded through certificate-checked Windows HTTPS and matched to torchvision's digests; certificate checks were not disabled.
 - Smoke tests checked execution paths, not model quality. Smoke and interrupted-run reports are excluded from the published result bundle.
-- The latest experiment development test run had 40 passing unit tests, plus compilation and dependency checks.
+- The latest experiment development test run had 41 passing unit tests, plus compilation and dependency checks.
 - Public JSON reports retain configurations, per-seed metrics, tuning candidates, split IDs where recorded, validation histories, timing samples, and provenance hashes. Artifact paths refer to local checkpoints that must be regenerated; their presence in JSON does not mean checkpoints are published.

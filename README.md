@@ -335,7 +335,7 @@ Reports and all nine tuning checkpoints plus 60 evaluation artifacts are in `res
 .venv/Scripts/python contrastive_experiment.py --diagnose-from results/contrastive --reference-itq-from results/kmnist-itq-costs --output-dir results/contrastive-itq-validation-next
 ```
 
-This diagnostic reuses the selected seed-42 KMNIST contrastive encoders at temperatures 0.5/0.5/0.2, without retraining or changing the encoder weights. It fits one 50-iteration ITQ rotation per bit length on all 50,000 training embeddings, using training-mean centering and no whitening. Evaluation uses the same 2,000 validation queries previously used for temperature selection, against the 50,000 training database items. No MNIST or official test queries are loaded. The optional PCA + ITQ reference reuses its saved seed-42 KMNIST projection/rotation and is scored against the identical database and queries.
+By default, this diagnostic reuses the selected seed-42 KMNIST contrastive encoders at temperatures 0.5/0.5/0.2, without retraining or changing the encoder weights. It fits one 50-iteration ITQ rotation per bit length on all 50,000 training embeddings, using training-mean centering and no whitening. Evaluation uses the same 2,000 validation queries previously used for temperature selection, against the 50,000 training database items. No MNIST or official test queries are loaded. The optional PCA + ITQ reference reuses its saved seed-42 KMNIST projection/rotation and is scored against the identical database and queries.
 
 These are **single-seed development precision@10 (%)**, not five-seed means or fresh test estimates:
 
@@ -355,6 +355,35 @@ The run took 36 seconds. All source files remained hash-identical; all three out
 
 Reports are in `results/contrastive-itq-validation/`, with source hashes, dataset row IDs, objective histories, and all seven retrieval variants. The two JSON reports are tracked; model files remain ignored. After `load_artifact`, use `saved_codes(transform, arrays, images, itq=True)` for rotated codes. `fit_itq_artifact` now supports both PCA and saved neural encoders. On a fresh clone, regenerate the selected KMNIST checkpoints and PCA ITQ artifacts before running the diagnostic.
 
+## Contrastive ITQ: five-seed development replication
+
+```powershell
+foreach ($seed in 7,21,84,123) {
+    .venv/Scripts/python contrastive_experiment.py --diagnose-from results/contrastive --diagnostic-seed $seed --reference-itq-from results/kmnist-itq-costs --output-dir "results/contrastive-itq-seed-$seed-next"
+    if ($LASTEXITCODE -ne 0) { throw "Replication failed for seed $seed" }
+}
+```
+
+The four additional seeds use the original temperatures 0.5/0.5/0.2, quantization weight 0.001, augmentations, 20 epochs, batch size 256, and validation-objective checkpoint rule. Each of 12 new KMNIST encoders is fitted once from scratch, then frozen while comparing median codes, centered-sign codes, and a 50-iteration training-only ITQ rotation. There is no temperature search, retraining after rotation, or MNIST/test evaluation. `--diagnostic-seed` must belong to the frozen source experiment's seed list; omitting it, or passing 42, reuses the original selected checkpoints.
+
+Each seed uses its own 50,000 training/database images and the first 2,000 images of its disjoint 10,000-image validation partition. Saved PCA + ITQ artifacts for that same seed supply the reference on identical images. The existing seed-42 diagnostic is reused in the five-seed aggregate. These are development results: seed 42 selected the temperatures, validation also selects checkpoints, and the seed-dependent splits overlap across runs.
+
+Validation precision@10 (%), mean +/- sample standard deviation across seeds 42, 7, 21, 84, and 123:
+
+| Representation | 16 dimensions/bits | 32 dimensions/bits | 64 dimensions/bits |
+|---|---:|---:|---:|
+| Contrastive continuous Euclidean | 82.92 +/- 0.98 | 83.05 +/- 0.97 | 87.24 +/- 0.87 |
+| Contrastive continuous cosine | 83.42 +/- 1.05 | 83.50 +/- 0.82 | 87.99 +/- 0.73 |
+| Contrastive centered continuous cosine | 83.47 +/- 1.01 | 83.55 +/- 0.80 | 87.95 +/- 0.77 |
+| Contrastive median binary | 69.34 +/- 2.04 | 76.29 +/- 1.52 | 82.37 +/- 0.85 |
+| Contrastive centered sign | 69.46 +/- 1.61 | 76.24 +/- 1.44 | 82.50 +/- 0.94 |
+| Contrastive + ITQ binary | 72.93 +/- 1.17 | 77.66 +/- 1.20 | 84.72 +/- 0.93 |
+| PCA + ITQ reference | 72.75 +/- 1.18 | 83.16 +/- 0.84 | 88.91 +/- 0.49 |
+
+Paired ITQ gains over contrastive median codes were **3.58 +/- 1.38, 1.36 +/- 0.72, and 2.35 +/- 0.32 points**, with wins in all five seeds at every width. ITQ also beat the centered-sign control in all 15 comparisons. Against PCA + ITQ, mean gaps were +0.18, -5.50, and -4.19 points, with wins in 4/5, 0/5, and 0/5 seeds. The 16-bit result is a near tie given its paired-gap standard deviation of 1.16 points, not a demonstrated general advantage.
+
+The four replications took 5 minutes 48 seconds combined. Reports are in `results/contrastive-itq-seed-{7,21,84,123}/`; seed 42 remains in `results/contrastive-itq-validation/`. Each new report retains its frozen source training configuration, fitting histories, split IDs, reference/source hashes, and all seven retrieval variants. All encoder copies stayed byte-identical through rotation; all 15 ITQ artifacts across five seeds passed reload checks. Raw model files remain excluded from Git. Encoding speed was not remeasured.
+
 ## Next decision
 
-Replicate contrastive + ITQ across additional development seeds before adopting it. The single-seed gain is promising, especially at 16 bits, but it does not establish a fresh-test improvement or close the 32/64-bit gap to PCA + ITQ. Keep the encoder frozen during that comparison and do not tune against the inspected MNIST test results.
+Use contrastive + ITQ as the improved neural baseline: its gain over unrotated contrastive codes replicated, but it does not establish superiority to PCA + ITQ. The classical baseline remains cheaper and clearly stronger at 32/64 bits in this diagnostic. Further learned-hashing changes should address representation or quantization quality through a predeclared development ablation, not another search on inspected test results.

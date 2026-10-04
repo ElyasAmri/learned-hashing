@@ -178,12 +178,19 @@ def diagnose_selected(args):
         raise ValueError("Diagnostics require KMNIST validation tuning with median thresholds")
     if versions != tuning["versions"]:
         raise ValueError("Library versions differ from the saved encoders")
-    seed = config["tuning_seed"]
+    requested_seed = getattr(args, "diagnostic_seed", None)
+    seed = config["tuning_seed"] if requested_seed is None else requested_seed
+    if requested_seed is not None and seed not in config["seeds"]:
+        raise ValueError("Diagnostic seed must belong to the frozen experiment's seed list")
+    train_new_encoder = seed != config["tuning_seed"]
+    if train_new_encoder and config["quantization_weight"] != QUANTIZATION_WEIGHT:
+        raise ValueError("Quantization weight differs from the frozen training recipe")
     selected = [next(r for r in tuning["results"] if r["bits"] == bits
                      and r["temperature"] == tuning["selected_temperatures"][str(bits)]) for bits in config["bits"]]
     source_paths = [tuning_path]
-    for result in selected:
-        source_paths.extend(Path(result["artifact_dir"]) / name for name in ["transform.npz", "autoencoder.pt"])
+    if not train_new_encoder:
+        for result in selected:
+            source_paths.extend(Path(result["artifact_dir"]) / name for name in ["transform.npz", "autoencoder.pt"])
     if args.reference_itq_from is not None:
         reference_path = args.reference_itq_from / "protocol.json"
         reference = json.loads(reference_path.read_text())
@@ -198,13 +205,14 @@ def diagnose_selected(args):
     protocol = {"config": {"dataset": "kmnist", "query_split": "validation", "seed": seed,
                            "bits": config["bits"], "train_size": config["train_size"],
                            "validation_size": config["validation_size"], "query_size": config["tuning_queries"],
-                           "itq_iterations": 50, "encoders_retrained": False, "device": args.device,
+                           "itq_iterations": 50, "encoders_retrained": train_new_encoder, "device": args.device,
                            "data_dir": str(args.data_dir), "smoke": config["smoke"]},
+                "source_training_config": config,
                 "selected_temperatures": tuning["selected_temperatures"], "versions": versions,
                 "source_sha256": hashes}
     save_report(args.output_dir / "protocol.json", protocol)
     start = time.perf_counter()
-    train, _, queries, labels, query_labels, ids = load_data(
+    train, validation, queries, labels, query_labels, ids = load_data(
         args.data_dir, seed, config["train_size"], config["validation_size"], config["tuning_queries"],
         query_split="validation", dataset="kmnist", return_ids=True)
     results = []
@@ -212,6 +220,14 @@ def diagnose_selected(args):
         bits = original["bits"]
         print(f"Diagnosing contrastive KMNIST validation, {bits} bits", flush=True)
         source = Path(original["artifact_dir"])
+        encoder_fit = None
+        if train_new_encoder:
+            source = args.output_dir / "encoders" / f"contrastive-{bits}"
+            encoder_fit = fit_paired_artifact(train, validation, bits, seed, "contrastive", original["temperature"],
+                                              config, args.device, source)
+            for name in ["transform.npz", "autoencoder.pt"]:
+                path = source / name
+                hashes[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
         directory = args.output_dir / "models" / f"contrastive_itq-{bits}"
         extra = fit_itq_artifact(train, source, directory, seed, device=args.device)
         transform, arrays = load_artifact(source, args.device)
@@ -221,8 +237,9 @@ def diagnose_selected(args):
                                       (query_latent - rotated["latent_mean"]) @ rotated["rotation"] > 0)
         metrics = latent_diagnostics(latent, query_latent, labels, query_labels, arrays["binary_thresholds"],
                                      rotated["latent_mean"], rotated["rotation"])
-        np.testing.assert_equal(metrics["median_binary"]["validation_precision_at_10"],
-                                original["validation_precision_at_10"])
+        if not train_new_encoder:
+            np.testing.assert_equal(metrics["median_binary"]["validation_precision_at_10"],
+                                    original["validation_precision_at_10"])
         if args.reference_itq_from is not None:
             reference_dir = args.reference_itq_from / "models" / f"seed-{seed}" / f"pca_itq-{bits}"
             project, pca_arrays = load_artifact(reference_dir)
@@ -232,7 +249,8 @@ def diagnose_selected(args):
             metrics["pca_itq_reference"] = reference_metrics
         results.append({"bits": bits, "temperature": original["temperature"], "retrieval": metrics,
                         "source_artifact_dir": str(source), "artifact_dir": str(directory),
-                        "median_score_matches_tuning": True, **extra})
+                        "median_score_matches_tuning": None if train_new_encoder else True,
+                        "encoder_fit": encoder_fit, **extra})
         print("  " + ", ".join(f"{name}={value['validation_precision_at_10']:.5f}" for name, value in metrics.items()), flush=True)
     for path, expected in hashes.items():
         if hashlib.sha256(Path(path).read_bytes()).hexdigest() != expected:
@@ -249,7 +267,8 @@ def main():
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda")
     parser.add_argument("--smoke", action="store_true", help="Reduced KMNIST-only validation run; never loads MNIST")
-    parser.add_argument("--diagnose-from", type=Path, help="Diagnose selected saved KMNIST encoders without retraining")
+    parser.add_argument("--diagnose-from", type=Path, help="Diagnose selected KMNIST encoders with frozen settings")
+    parser.add_argument("--diagnostic-seed", type=int, help="Replicate a frozen source seed; fit its encoder if not the tuning seed")
     parser.add_argument("--reference-itq-from", type=Path, help="Saved KMNIST PCA ITQ benchmark for the diagnostic")
     args = parser.parse_args()
     if args.diagnose_from is not None:
@@ -257,8 +276,8 @@ def main():
             parser.error("Diagnostic mode uses the source report's settings, not --stage or --smoke")
         diagnose_selected(args)
         return
-    if args.reference_itq_from is not None:
-        parser.error("--reference-itq-from requires --diagnose-from")
+    if args.reference_itq_from is not None or args.diagnostic_seed is not None:
+        parser.error("--reference-itq-from and --diagnostic-seed require --diagnose-from")
     config = {"bits": [16, 32, 64], "seeds": [42, 7, 21, 84, 123], "epochs": 20, "batch_size": 256,
               "train_size": 50000, "validation_size": 10000, "tuning_queries": 2000, "query_pool_size": 10000,
               "temperatures": [0.1, 0.2, 0.5], "quantization_weight": QUANTIZATION_WEIGHT,
